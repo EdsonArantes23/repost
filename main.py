@@ -95,7 +95,6 @@ def extract_video_url(div):
                 src = f"https://xcancel.com{src}"
             return src
 
-    # Ищем видео во вложениях
     for att in div.select("div.attachment, div.attachments"):
         vid = att.select_one("video")
         if vid:
@@ -111,6 +110,46 @@ def extract_video_url(div):
                     src = f"https://xcancel.com{src}"
                 return src
 
+    return None
+
+def extract_quote_text(div):
+    """
+    Ищет текст оригинального поста для quote-твитов.
+    Возвращает словарь {author, text} или None.
+    """
+    # Ищем блок с цитируемым твитом
+    quote_div = div.select_one("div.quote-tweet, div.quoted-tweet, div.tweet-quote")
+    if not quote_div:
+        return None
+
+    quote_author = None
+    quote_text = None
+
+    # Автор оригинального твита
+    author_tag = quote_div.select_one("a.username, span.username, div.tweet-header span")
+    if author_tag:
+        quote_author = author_tag.get_text(strip=True)
+    if not quote_author:
+        author_tag = quote_div.select_one("a[href*='status']")
+        if author_tag:
+            quote_author = author_tag.get_text(strip=True)
+            # Если текста нет, пробуем взять из href
+            if not quote_author:
+                href = author_tag.get("href", "")
+                match = re.search(r'/(\w+)/status/', href)
+                if match:
+                    quote_author = f"@{match.group(1)}"
+
+    # Текст оригинального твита
+    text_tag = quote_div.select_one("div.tweet-content, div.quote-content, div.quoted-content")
+    if text_tag:
+        quote_text = text_tag.get_text(strip=True)
+
+    if quote_text:
+        return {
+            "author": quote_author if quote_author else "Оригинальный пост",
+            "text": quote_text
+        }
     return None
 
 async def fetch_tweets(username):
@@ -171,11 +210,15 @@ async def fetch_tweets(username):
                 # Видео
                 video_url = extract_video_url(div)
 
+                # Quote-твит
+                quote = extract_quote_text(div)
+
                 tweets.append({
                     "text": text,
                     "link": link,
                     "images": images,
                     "video": video_url,
+                    "quote": quote,
                     "display_name": display_name,
                     "username": username
                 })
@@ -524,6 +567,14 @@ async def cmd_force(update, context):
 # --- ОСНОВНАЯ ЛОГИКА ---
 async def send_post(bot: Bot, tweet, username):
     text = tweet["text"]
+    quote = tweet.get("quote")
+
+    # Если есть quote-твит — добавляем его текст
+    if quote:
+        quote_author = quote.get("author", "Оригинальный пост")
+        quote_text = quote.get("text", "")
+        text += f"\n\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n{quote_author}:\n{quote_text}\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄"
+
     signature = f"\n\n{tweet['display_name']} | https://x.com/{username}"
     full_text = text + signature
     images = tweet["images"]
@@ -531,7 +582,6 @@ async def send_post(bot: Bot, tweet, username):
 
     try:
         if video_url:
-            # Отправляем видео
             await bot.send_video(
                 chat_id=TELEGRAM_CHANNEL_ID,
                 video=video_url,
@@ -553,7 +603,6 @@ async def send_post(bot: Bot, tweet, username):
             await bot.send_message(TELEGRAM_CHANNEL_ID, full_text)
     except TelegramError as e:
         logger.error(f"Ошибка отправки: {e}")
-        # Пробуем без вложений
         try:
             await bot.send_message(TELEGRAM_CHANNEL_ID, full_text)
         except:
@@ -592,8 +641,16 @@ async def check_and_post(bot: Bot):
             post_id = tweet["link"]
             if post_id in sent_posts:
                 continue
-            if not post_matches_filter(tweet["text"], keywords):
+
+            # Проверяем и текст поста, и текст quote-твита
+            check_text = tweet["text"]
+            quote = tweet.get("quote")
+            if quote:
+                check_text += " " + quote.get("text", "")
+
+            if not post_matches_filter(check_text, keywords):
                 continue
+
             await send_post(bot, tweet, username)
             save_sent_post(post_id)
             sent_posts.add(post_id)
