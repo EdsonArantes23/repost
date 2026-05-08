@@ -3,6 +3,7 @@ import os
 import logging
 import re
 import time
+import random
 
 import httpx
 import nest_asyncio
@@ -25,8 +26,11 @@ FANS_FILE = "chelsea_fans.txt"
 BLOGGERS_FILE = "general_bloggers.txt"
 KEYWORDS_FILE = "keywords.txt"
 
-# Только одно рабочее зеркало
-MIRROR = "https://nitter.net"
+# xcancel.com первым — он работал раньше
+MIRRORS = [
+    "https://xcancel.com",
+    "https://nitter.net",
+]
 
 adding_lock = asyncio.Lock()
 
@@ -93,19 +97,19 @@ def clean_images(images):
     return cleaned
 
 # --- ПАРСИНГ ТВИТОВ ---
-def extract_video_url(div):
+def extract_video_url(div, mirror):
     video_tag = div.select_one("video")
     if video_tag:
         src = video_tag.get("src", "")
         if src:
             if src.startswith("/"):
-                src = f"{MIRROR}{src}"
+                src = f"{mirror}{src}"
             return src
         source_tag = video_tag.select_one("source")
         if source_tag:
             src = source_tag.get("src", "")
             if src and src.startswith("/"):
-                src = f"{MIRROR}{src}"
+                src = f"{mirror}{src}"
             return src
     for att in div.select("div.attachment, div.attachments"):
         vid = att.select_one("video")
@@ -113,13 +117,13 @@ def extract_video_url(div):
             src = vid.get("src", "")
             if src:
                 if src.startswith("/"):
-                    src = f"{MIRROR}{src}"
+                    src = f"{mirror}{src}"
                 return src
             source_tag = vid.select_one("source")
             if source_tag:
                 src = source_tag.get("src", "")
                 if src and src.startswith("/"):
-                    src = f"{MIRROR}{src}"
+                    src = f"{mirror}{src}"
                 return src
     return None
 
@@ -148,76 +152,84 @@ def extract_quote_text(div):
         return {"author": quote_author if quote_author else "Оригинальный пост", "text": quote_text}
     return None
 
-async def fetch_tweets(username):
-    """Парсит твиты с nitter.net. Возвращает (display_name, tweets)."""
-    url = f"{MIRROR}/{username}"
+async def try_fetch_from_mirror(mirror, username):
+    url = f"{mirror}/{username}"
     tweets = []
     display_name = username
 
-    try:
-        async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "en-US,en;q=0.5"
-            }
-            response = await client.get(url, headers=headers)
-            response.raise_for_status()
+    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.5"
+        }
+        response = await client.get(url, headers=headers)
+        response.raise_for_status()
 
-            soup = BeautifulSoup(response.text, "lxml")
+        soup = BeautifulSoup(response.text, "lxml")
 
-            profile_name_tag = soup.select_one("a.profile-card-fullname")
-            if profile_name_tag:
-                display_name = profile_name_tag.get_text(strip=True)
+        profile_name_tag = soup.select_one("a.profile-card-fullname")
+        if profile_name_tag:
+            display_name = profile_name_tag.get_text(strip=True)
 
-            tweet_divs = soup.select("div.timeline-item")
+        tweet_divs = soup.select("div.timeline-item")
 
-            for div in tweet_divs:
-                content_div = div.select_one("div.tweet-content")
-                if not content_div:
-                    continue
-                text = content_div.get_text(strip=True)
+        for div in tweet_divs:
+            content_div = div.select_one("div.tweet-content")
+            if not content_div:
+                continue
+            text = content_div.get_text(strip=True)
 
-                link_tag = div.select_one("a.tweet-link")
-                if not link_tag:
-                    continue
-                link = link_tag.get("href", "")
-                if link and not link.startswith("http"):
-                    link = f"{MIRROR}{link}"
-                link = re.sub(r'https?://[^/]+/', 'https://x.com/', link)
+            link_tag = div.select_one("a.tweet-link")
+            if not link_tag:
+                continue
+            link = link_tag.get("href", "")
+            if link and not link.startswith("http"):
+                link = f"{mirror}{link}"
+            link = re.sub(r'https?://[^/]+/', 'https://x.com/', link)
 
-                images = []
-                for att in div.select("div.attachment, div.attachments"):
-                    for img in att.select("img"):
-                        src = img.get("src", "")
-                        if src and not src.startswith("data:"):
-                            if src.startswith("/"):
-                                src = f"{MIRROR}{src}"
-                            images.append(src)
+            images = []
+            for att in div.select("div.attachment, div.attachments"):
+                for img in att.select("img"):
+                    src = img.get("src", "")
+                    if src and not src.startswith("data:"):
+                        if src.startswith("/"):
+                            src = f"{mirror}{src}"
+                        images.append(src)
 
-                images = clean_images(images)
-                video_url = extract_video_url(div)
-                quote = extract_quote_text(div)
+            images = clean_images(images)
+            video_url = extract_video_url(div, mirror)
+            quote = extract_quote_text(div)
 
-                tweets.append({
-                    "text": text,
-                    "link": link,
-                    "images": images,
-                    "video": video_url,
-                    "quote": quote,
-                    "display_name": display_name,
-                    "username": username
-                })
+            tweets.append({
+                "text": text,
+                "link": link,
+                "images": images,
+                "video": video_url,
+                "quote": quote,
+                "display_name": display_name,
+                "username": username
+            })
 
-        logger.info(f"✅ @{username}: {len(tweets)} твитов загружено")
-        return display_name, tweets
+    return display_name, tweets
 
-    except Exception as e:
-        logger.error(f"❌ @{username}: {e}")
-        return username, []
+async def fetch_tweets(username):
+    mirrors = MIRRORS.copy()
+    random.shuffle(mirrors)
+    for mirror in mirrors:
+        try:
+            display_name, tweets = await try_fetch_from_mirror(mirror, username)
+            if tweets:
+                logger.info(f"✅ @{username}: {len(tweets)} твитов через {mirror}")
+                return display_name, tweets
+        except httpx.HTTPStatusError as e:
+            logger.warning(f"⚠️ {mirror} -> {e.response.status_code} для @{username}")
+        except Exception as e:
+            logger.warning(f"⚠️ {mirror} -> {type(e).__name__}: {e} для @{username}")
+    logger.error(f"❌ @{username}: все зеркала недоступны")
+    return username, []
 
 async def mark_all_current_as_sent(username):
-    """До 3 попыток отметить все текущие посты."""
     for attempt in range(3):
         _, tweets = await fetch_tweets(username)
         if tweets:
@@ -271,7 +283,7 @@ async def cmd_addfan(update, context):
 async def cmd_addmanyfan(update, context):
     if not is_admin(update.effective_user.id): return
     if not context.args:
-        await update.message.reply_text("❌ /addmanyfan ссылки через пробел или списком"); return
+        await update.message.reply_text("❌ /addmanyfan ссылки"); return
     raw_input = " ".join(context.args)
     mentions = re.findall(r'@(\w+)', raw_input)
     links = re.findall(r'https?://(?:x\.com|twitter\.com)/(\w+)', raw_input)
@@ -472,9 +484,7 @@ async def send_post(bot: Bot, tweet, username):
     text = tweet["text"]
     quote = tweet.get("quote")
     if quote:
-        quote_author = quote.get("author", "Оригинальный пост")
-        quote_text = quote.get("text", "")
-        text += f"\n\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n{quote_author}:\n{quote_text}\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄"
+        text += f"\n\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n{quote['author']}:\n{quote['text']}\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄"
     signature = f"\n\n{tweet['display_name']} | https://x.com/{username}"
     full_text = text + signature
     images = tweet["images"]
@@ -506,7 +516,6 @@ async def send_post(bot: Bot, tweet, username):
 async def check_and_post(bot: Bot):
     async with adding_lock:
         pass
-
     fans = load_fans()
     bloggers = load_bloggers()
     keywords = load_keywords()
@@ -536,9 +545,8 @@ async def check_and_post(bot: Bot):
             if tweet["link"] in sent_posts:
                 continue
             check_text = tweet["text"]
-            quote = tweet.get("quote")
-            if quote:
-                check_text += " " + quote.get("text", "")
+            if tweet.get("quote"):
+                check_text += " " + tweet["quote"]["text"]
             if not post_matches_filter(check_text, keywords):
                 continue
             await send_post(bot, tweet, username)
@@ -562,7 +570,6 @@ async def main():
     if not TELEGRAM_BOT_TOKEN:
         logger.critical("❌ Нет BOT_TOKEN!")
         return
-
     bot = Bot(token=TELEGRAM_BOT_TOKEN)
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
@@ -580,7 +587,6 @@ async def main():
     app.add_handler(CommandHandler("listwords", cmd_listwords))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("force", cmd_force))
-
     asyncio.create_task(scheduled_check(bot))
     logger.info("🤖 Бот запущен")
     await app.run_polling()
