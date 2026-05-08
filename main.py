@@ -1,42 +1,39 @@
 import asyncio
 import os
 import logging
-import sys
-import subprocess
-from io import StringIO
+import re
+from datetime import datetime
 
-from telegram import Bot
+import httpx
+from bs4 import BeautifulSoup
+from telegram import Bot, InputMediaPhoto
 from telegram.error import TelegramError
 from telegram.ext import Application, CommandHandler, ContextTypes
-import feedparser
 
 # --- ЛОГИ ---
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- НАСТРОЙКИ ---
+# --- НАСТРОЙКИ (ЖЁСТКО В КОДЕ) ---
 TELEGRAM_BOT_TOKEN = os.getenv("BOT_TOKEN")  # Bothost пробрасывает сам
 TELEGRAM_CHANNEL_ID = -1003857194781         # Ваш канал
 ADMIN_ID = 417850992                         # Ваш Telegram ID
 
 SENT_POSTS_FILE = "sent_posts.txt"
-ACCOUNTS_FILE = "x_accounts.txt"  # Список аккаунтов храним в файле
+ACCOUNTS_FILE = "x_accounts.txt"
 
 # --- ЗАГРУЗКА/СОХРАНЕНИЕ АККАУНТОВ ---
 def load_accounts():
-    """Читаем список отслеживаемых аккаунтов из файла"""
     try:
         with open(ACCOUNTS_FILE, "r", encoding="utf-8") as f:
             accounts = [line.strip() for line in f if line.strip()]
-        return accounts if accounts else ["ChelseaFC"]  # Дефолтный если файл пуст
+        return accounts if accounts else ["ChelseaFC"]
     except FileNotFoundError:
-        # Если файла нет — создаём с дефолтным списком
         default = ["ChelseaFC", "FabrizioRomano"]
         save_accounts(default)
         return default
 
 def save_accounts(accounts):
-    """Сохраняем список аккаунтов в файл"""
     with open(ACCOUNTS_FILE, "w", encoding="utf-8") as f:
         for acc in accounts:
             f.write(acc + "\n")
@@ -53,110 +50,85 @@ def save_sent_post(post_id):
     with open(SENT_POSTS_FILE, "a") as f:
         f.write(post_id + "\n")
 
-# --- СКРАПИНГ ТВИТОВ (БЕСПЛАТНО, БЕЗ API) ---
-def get_tweets_as_feed(username):
+# --- ПАРСИНГ ТВИТОВ (БЕСПЛАТНО, БЕЗ API) ---
+async def fetch_tweets(username):
     """
-    Получаем твиты через xcancel.com и tweeper.
-    Возвращает feedparser-объект или None при ошибке.
+    Парсим твиты напрямую с xcancel.com.
+    Возвращаем список словарей с текстом, ссылками и картинками.
     """
+    url = f"https://xcancel.com/{username}"
+    tweets = []
+
     try:
-        result = subprocess.run(
-            [sys.executable, "-m", "tweeper", f"https://xcancel.com/{username}"],
-            capture_output=True,
-            text=True,
-            timeout=25
-        )
-        feed_xml = result.stdout
-        if not feed_xml.strip():
-            logger.warning(f"Пустой ответ от xcancel.com для @{username}")
-            return None
-        return feedparser.parse(StringIO(feed_xml))
-    except subprocess.TimeoutExpired:
-        logger.warning(f"Таймаут при получении твитов от @{username}")
-        return None
+        async with httpx.AsyncClient(timeout=25.0, follow_redirects=True) as client:
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.5"
+            }
+            response = await client.get(url, headers=headers)
+            response.raise_for_status()
+
+            soup = BeautifulSoup(response.text, "lxml")
+
+            # Ищем все посты (твиты)
+            tweet_divs = soup.select("div.timeline-item")
+
+            for div in tweet_divs:
+                # Текст твита
+                content_div = div.select_one("div.tweet-content")
+                if not content_div:
+                    continue
+                text = content_div.get_text(strip=True)
+
+                # Ссылка на твит
+                link_tag = div.select_one("a.tweet-link")
+                if not link_tag:
+                    continue
+                link = link_tag.get("href", "")
+                if link and not link.startswith("http"):
+                    link = f"https://xcancel.com{link}"
+                # Заменяем xcancel.com на x.com для финальной ссылки
+                link = link.replace("xcancel.com", "x.com")
+
+                # Картинки
+                images = []
+                # Ищем вложения
+                attachment_divs = div.select("div.attachment, div.attachments")
+                for att in attachment_divs:
+                    img_tags = att.select("img")
+                    for img in img_tags:
+                        src = img.get("src", "")
+                        if src and not src.startswith("data:"):
+                            if src.startswith("/"):
+                                src = f"https://xcancel.com{src}"
+                            images.append(src)
+
+                # Если нет вложений, ищем в теле твита
+                if not images:
+                    img_tags = div.select("div.tweet-body img")
+                    for img in img_tags:
+                        src = img.get("src", "")
+                        if src and not src.startswith("data:") and "emoji" not in src.lower():
+                            if src.startswith("/"):
+                                src = f"https://xcancel.com{src}"
+                            images.append(src)
+
+                tweets.append({
+                    "text": text,
+                    "link": link,
+                    "images": images,
+                    "author": username
+                })
+
+    except httpx.HTTPStatusError as e:
+        logger.error(f"HTTP ошибка для @{username}: {e.response.status_code}")
     except Exception as e:
-        logger.error(f"Ошибка получения твитов от @{username}: {e}")
-        return None
+        logger.error(f"Ошибка парсинга @{username}: {e}")
 
-def extract_images(entry):
-    """
-    Ищем ссылки на изображения в твите.
-    Возвращаем список URL картинок.
-    """
-    images = []
-    
-    # Способ 1: через media_content в RSS
-    if hasattr(entry, "media_content") and entry.media_content:
-        for media in entry.media_content:
-            if "url" in media and (media.get("type", "").startswith("image") or media["url"].endswith((".jpg", ".jpeg", ".png"))):
-                images.append(media["url"])
-    
-    # Способ 2: через ссылки в summary/description
-    if hasattr(entry, "summary") and entry.summary:
-        import re
-        img_urls = re.findall(r'https?://\S+?\.(?:jpg|jpeg|png|webp)', entry.summary, re.IGNORECASE)
-        images.extend(img_urls)
-    
-    # Способ 3: через links (если есть фото напрямую)
-    if hasattr(entry, "links"):
-        for link in entry.links:
-            if "image" in link.get("type", "") or link.get("href", "").endswith((".jpg", ".jpeg", ".png")):
-                images.append(link["href"])
-    
-    # Убираем дубли
-    return list(set(images))
+    return tweets
 
-def extract_author_info(entry, username):
-    """
-    Извлекаем имя автора и формируем подпись.
-    """
-    # Пробуем взять author из RSS
-    author_name = None
-    if hasattr(entry, "author") and entry.author:
-        author_name = entry.author
-    elif hasattr(entry, "source") and entry.source:
-        if hasattr(entry.source, "title") and entry.source.title:
-            author_name = entry.source.title
-    
-    # Если не нашли — используем username
-    if not author_name:
-        author_name = username
-    
-    # Очищаем имя (убираем лишнее)
-    author_name = author_name.strip()
-    
-    # Если имя начинается с @ — оставляем как есть
-    if not author_name.startswith("@"):
-        author_name = f"@{author_name}"
-    
-    return author_name
-
-def format_post(entry, username):
-    """
-    Форматируем пост в нужном стиле:
-    
-    Текст поста (полностью)
-    
-    ИмяАвтора | https://x.com/ИмяАвтораВСылке
-    """
-    text = entry.title if hasattr(entry, "title") and entry.title else ""
-    
-    # Очищаем текст от возможных URL в конце (если они приклеились)
-    if " http" in text:
-        text = text.rsplit(" http", 1)[0].strip()
-    
-    # Автор
-    author_name = extract_author_info(entry, username)
-    
-    # Ссылка на пост
-    post_link = entry.link if hasattr(entry, "link") else f"https://x.com/{username}"
-    
-    # Формируем подпись
-    signature = f"\n\n{author_name} | {post_link}"
-    
-    return text + signature
-
-# --- АДМИН-КОМАНДЫ ДЛЯ ЛИЧКИ ---
+# --- АДМИН-КОМАНДЫ ---
 def is_admin(user_id):
     return user_id == ADMIN_ID
 
@@ -164,7 +136,7 @@ async def cmd_start(update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("🚫 Доступ запрещён.")
         return
-    
+
     await update.message.reply_text(
         "👋 Привет, админ!\n\n"
         "📋 Команды управления:\n\n"
@@ -172,69 +144,63 @@ async def cmd_start(update, context: ContextTypes.DEFAULT_TYPE):
         "/remove @username — удалить канал\n"
         "/list — список каналов\n"
         "/status — проверка работы\n"
-        "/force — принудительная проверка\n\n"
-        "Формат поста:\n"
-        "• Текст из твита\n"
-        "• Фотографии (если есть)\n"
-        "• Подпись: ИмяАвтора | ссылка"
+        "/force — принудительная проверка"
     )
 
 async def cmd_add(update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("🚫 Доступ запрещён.")
         return
-    
+
     if not context.args or len(context.args) != 1:
         await update.message.reply_text(
-            "❌ Укажите username для добавления.\n"
-            "Пример: /add @ChelseaFC"
+            "❌ Укажите username.\nПример: /add @ChelseaFC"
         )
         return
-    
+
     username = context.args[0].strip().lstrip("@")
     accounts = load_accounts()
-    
+
     if username in accounts:
         await update.message.reply_text(f"⚠️ @{username} уже в списке.")
         return
-    
+
     accounts.append(username)
     save_accounts(accounts)
-    await update.message.reply_text(f"✅ @{username} добавлен в отслеживание.")
+    await update.message.reply_text(f"✅ @{username} добавлен.")
 
 async def cmd_remove(update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("🚫 Доступ запрещён.")
         return
-    
+
     if not context.args or len(context.args) != 1:
         await update.message.reply_text(
-            "❌ Укажите username для удаления.\n"
-            "Пример: /remove @ChelseaFC"
+            "❌ Укажите username.\nПример: /remove @ChelseaFC"
         )
         return
-    
+
     username = context.args[0].strip().lstrip("@")
     accounts = load_accounts()
-    
+
     if username not in accounts:
-        await update.message.reply_text(f"⚠️ @{username} не найден в списке.")
+        await update.message.reply_text(f"⚠️ @{username} не найден.")
         return
-    
+
     accounts.remove(username)
     save_accounts(accounts)
-    await update.message.reply_text(f"✅ @{username} удалён из отслеживания.")
+    await update.message.reply_text(f"✅ @{username} удалён.")
 
 async def cmd_list(update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("🚫 Доступ запрещён.")
         return
-    
+
     accounts = load_accounts()
     if not accounts:
         await update.message.reply_text("📋 Список пуст.")
         return
-    
+
     accounts_list = "\n".join([f"• @{acc}" for acc in accounts])
     await update.message.reply_text(
         f"📋 Отслеживаемые каналы ({len(accounts)}):\n\n{accounts_list}"
@@ -244,7 +210,7 @@ async def cmd_status(update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("🚫 Доступ запрещён.")
         return
-    
+
     accounts = load_accounts()
     sent = len(load_sent_posts())
     await update.message.reply_text(
@@ -258,103 +224,94 @@ async def cmd_force(update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("🚫 Доступ запрещён.")
         return
-    
+
     await update.message.reply_text("🔄 Запускаю принудительную проверку...")
-    await check_and_post(context.bot)
-    await update.message.reply_text("✅ Проверка завершена.")
+    count = await check_and_post(context.bot)
+    await update.message.reply_text(f"✅ Проверка завершена. Отправлено: {count} постов.")
 
 # --- ОСНОВНАЯ ЛОГИКА ---
 async def check_and_post(bot: Bot):
     accounts = load_accounts()
     sent_posts = load_sent_posts()
-    
+    new_posts = 0
+
     if not accounts:
-        logger.info("Список аккаунтов пуст. Пропускаем проверку.")
-        return
-    
+        logger.info("Список аккаунтов пуст.")
+        return new_posts
+
     logger.info(f"🔄 Проверка {len(accounts)} аккаунтов...")
-    
+
     for username in accounts:
         logger.info(f"  Проверяю @{username}...")
-        feed = get_tweets_as_feed(username)
-        
-        if not feed:
-            logger.warning(f"  Не удалось получить данные от @{username}")
+        tweets = await fetch_tweets(username)
+
+        if not tweets:
             continue
-        
-        if not feed.entries:
-            logger.info(f"  Нет новых записей от @{username}")
-            continue
-        
-        for entry in feed.entries:
-            post_id = entry.link if hasattr(entry, "link") else str(hash(entry.title))
-            
+
+        for tweet in tweets:
+            post_id = tweet["link"]
+
             if post_id in sent_posts:
                 continue
-            
+
             # Форматируем пост
-            text = format_post(entry, username)
-            
-            # Ищем картинки
-            images = extract_images(entry)
-            
+            text = tweet["text"]
+            author = tweet["author"]
+            signature = f"\n\n{author} | {post_id}"
+            full_text = text + signature
+
+            images = tweet["images"]
+
             try:
                 if images:
-                    # Отправляем с первой картинкой и подписью
-                    media_group = []
-                    # Первое фото с подписью
-                    media_group.append(images[0])
-                    
                     if len(images) == 1:
-                        # Одна картинка
                         await bot.send_photo(
                             chat_id=TELEGRAM_CHANNEL_ID,
                             photo=images[0],
-                            caption=text,
-                            parse_mode='HTML'
+                            caption=full_text[:1024]  # Telegram limit for caption
                         )
-                    elif len(images) > 1:
-                        # Несколько картинок — отправляем альбомом
-                        from telegram import InputMediaPhoto
+                    else:
                         media = []
-                        for i, img_url in enumerate(images):
+                        for i, img_url in enumerate(images[:10]):  # Max 10 photos
                             if i == 0:
-                                # Первое фото с подписью
-                                media.append(InputMediaPhoto(media=img_url, caption=text, parse_mode='HTML'))
+                                media.append(InputMediaPhoto(
+                                    media=img_url,
+                                    caption=full_text[:1024]
+                                ))
                             else:
                                 media.append(InputMediaPhoto(media=img_url))
-                        
                         await bot.send_media_group(
                             chat_id=TELEGRAM_CHANNEL_ID,
                             media=media
                         )
                 else:
-                    # Без картинок — просто текст
                     await bot.send_message(
                         chat_id=TELEGRAM_CHANNEL_ID,
-                        text=text,
-                        parse_mode='HTML'
+                        text=full_text
                     )
-                
+
                 save_sent_post(post_id)
                 sent_posts.add(post_id)
-                logger.info(f"✅ Отправлен пост от @{username}")
-                
-                await asyncio.sleep(2)  # Пауза между постами
-                
+                new_posts += 1
+                logger.info(f"✅ Пост от @{username}")
+
+                await asyncio.sleep(2)
+
             except TelegramError as e:
                 logger.error(f"Ошибка отправки: {e}")
-                # Пробуем отправить без фото
+                # Пробуем без фото
                 try:
                     await bot.send_message(
                         chat_id=TELEGRAM_CHANNEL_ID,
-                        text=text,
-                        parse_mode='HTML'
+                        text=full_text
                     )
                     save_sent_post(post_id)
                     sent_posts.add(post_id)
+                    new_posts += 1
                 except:
                     pass
+
+    return new_posts
 
 # --- ТАЙМЕР ---
 async def scheduled_check(bot: Bot):
@@ -362,34 +319,34 @@ async def scheduled_check(bot: Bot):
         try:
             await check_and_post(bot)
         except Exception as e:
-            logger.error(f"Ошибка в цикле проверки: {e}")
-        await asyncio.sleep(120)  # Проверка каждые 2 минуты
+            logger.error(f"Ошибка в цикле: {e}")
+        await asyncio.sleep(120)  # Каждые 2 минуты
 
 # --- ЗАПУСК ---
 async def main():
     if not TELEGRAM_BOT_TOKEN:
         logger.critical("❌ Нет BOT_TOKEN!")
         return
-    
+
     bot = Bot(token=TELEGRAM_BOT_TOKEN)
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-    
-    # Регистрируем команды
+
+    # Команды
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("add", cmd_add))
     app.add_handler(CommandHandler("remove", cmd_remove))
     app.add_handler(CommandHandler("list", cmd_list))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("force", cmd_force))
-    
+
     # Фоновая проверка
     asyncio.create_task(scheduled_check(bot))
-    
-    logger.info("🤖 Бот запущен. Админка через личку.")
-    # Печатаем список аккаунтов при старте
+
+    # Стартовый список
     accounts = load_accounts()
-    logger.info(f"👀 Отслеживается {len(accounts)} аккаунтов: {', '.join(accounts)}")
-    
+    logger.info(f"🤖 Бот запущен. Каналов: {len(accounts)} — {', '.join(accounts)}")
+    logger.info("📩 Админ-команды доступны в личке.")
+
     await app.run_polling()
 
 if __name__ == "__main__":
