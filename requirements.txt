@@ -1,3 +1,5 @@
 feedparser==6.0.11
 python-telegram-bot[job-queue]==20.8
-tweeper
+httpx
+beautifulsoup4
+lxml
