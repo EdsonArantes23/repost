@@ -3,7 +3,6 @@ import os
 import logging
 import re
 import time
-import random
 
 import httpx
 import nest_asyncio
@@ -26,13 +25,9 @@ FANS_FILE = "chelsea_fans.txt"
 BLOGGERS_FILE = "general_bloggers.txt"
 KEYWORDS_FILE = "keywords.txt"
 
-# Только рабочие зеркала (без мёртвых)
-MIRRORS = [
-    "https://nitter.net",
-    "https://xcancel.com",
-]
+# Только одно рабочее зеркало
+MIRROR = "https://nitter.net"
 
-# Поток для синхронизации добавления (чтобы scheduled_check не мешал)
 adding_lock = asyncio.Lock()
 
 # --- ЗАГРУЗКА/СОХРАНЕНИЕ ---
@@ -90,44 +85,41 @@ def post_matches_filter(text, keywords):
 
 # --- ОЧИСТКА КАРТИНОК ---
 def clean_images(images):
-    """Оставляет только картинки с твиттера, убирает дубли."""
     cleaned = []
     for img in images:
-        # Только картинки с pbs.twimg.com (загруженные в твиттер)
         if "pbs.twimg.com" in img or "video.twimg.com" in img:
             if img not in cleaned:
                 cleaned.append(img)
     return cleaned
 
 # --- ПАРСИНГ ТВИТОВ ---
-def extract_video_url(div, mirror_base):
+def extract_video_url(div):
     video_tag = div.select_one("video")
     if video_tag:
         src = video_tag.get("src", "")
         if src:
             if src.startswith("/"):
-                src = f"{mirror_base}{src}"
+                src = f"{MIRROR}{src}"
             return src
         source_tag = video_tag.select_one("source")
         if source_tag:
             src = source_tag.get("src", "")
             if src and src.startswith("/"):
-                src = f"{mirror_base}{src}"
+                src = f"{MIRROR}{src}"
             return src
-
     for att in div.select("div.attachment, div.attachments"):
         vid = att.select_one("video")
         if vid:
             src = vid.get("src", "")
             if src:
                 if src.startswith("/"):
-                    src = f"{mirror_base}{src}"
+                    src = f"{MIRROR}{src}"
                 return src
             source_tag = vid.select_one("source")
             if source_tag:
                 src = source_tag.get("src", "")
                 if src and src.startswith("/"):
-                    src = f"{mirror_base}{src}"
+                    src = f"{MIRROR}{src}"
                 return src
     return None
 
@@ -156,99 +148,92 @@ def extract_quote_text(div):
         return {"author": quote_author if quote_author else "Оригинальный пост", "text": quote_text}
     return None
 
-async def try_fetch_from_mirror(mirror_url, username):
-    url = f"{mirror_url}/{username}"
+async def fetch_tweets(username):
+    """Парсит твиты с nitter.net. Возвращает (display_name, tweets)."""
+    url = f"{MIRROR}/{username}"
     tweets = []
     display_name = username
 
-    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.5"
-        }
-        response = await client.get(url, headers=headers)
-        response.raise_for_status()
+    try:
+        async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.5"
+            }
+            response = await client.get(url, headers=headers)
+            response.raise_for_status()
 
-        soup = BeautifulSoup(response.text, "lxml")
+            soup = BeautifulSoup(response.text, "lxml")
 
-        profile_name_tag = soup.select_one("a.profile-card-fullname")
-        if profile_name_tag:
-            display_name = profile_name_tag.get_text(strip=True)
+            profile_name_tag = soup.select_one("a.profile-card-fullname")
+            if profile_name_tag:
+                display_name = profile_name_tag.get_text(strip=True)
 
-        tweet_divs = soup.select("div.timeline-item")
+            tweet_divs = soup.select("div.timeline-item")
 
-        for div in tweet_divs:
-            content_div = div.select_one("div.tweet-content")
-            if not content_div:
-                continue
-            text = content_div.get_text(strip=True)
+            for div in tweet_divs:
+                content_div = div.select_one("div.tweet-content")
+                if not content_div:
+                    continue
+                text = content_div.get_text(strip=True)
 
-            link_tag = div.select_one("a.tweet-link")
-            if not link_tag:
-                continue
-            link = link_tag.get("href", "")
-            if link and not link.startswith("http"):
-                link = f"{mirror_url}{link}"
-            link = re.sub(r'https?://[^/]+/', 'https://x.com/', link)
+                link_tag = div.select_one("a.tweet-link")
+                if not link_tag:
+                    continue
+                link = link_tag.get("href", "")
+                if link and not link.startswith("http"):
+                    link = f"{MIRROR}{link}"
+                link = re.sub(r'https?://[^/]+/', 'https://x.com/', link)
 
-            images = []
-            # Только из вложений (attachment) — это реальные картинки твита
-            for att in div.select("div.attachment, div.attachments"):
-                for img in att.select("img"):
-                    src = img.get("src", "")
-                    if src and not src.startswith("data:"):
-                        if src.startswith("/"):
-                            src = f"{mirror_url}{src}"
-                        images.append(src)
+                images = []
+                for att in div.select("div.attachment, div.attachments"):
+                    for img in att.select("img"):
+                        src = img.get("src", "")
+                        if src and not src.startswith("data:"):
+                            if src.startswith("/"):
+                                src = f"{MIRROR}{src}"
+                            images.append(src)
 
-            # Убираем дубли и сторонние картинки
-            images = clean_images(images)
+                images = clean_images(images)
+                video_url = extract_video_url(div)
+                quote = extract_quote_text(div)
 
-            video_url = extract_video_url(div, mirror_url)
-            quote = extract_quote_text(div)
+                tweets.append({
+                    "text": text,
+                    "link": link,
+                    "images": images,
+                    "video": video_url,
+                    "quote": quote,
+                    "display_name": display_name,
+                    "username": username
+                })
 
-            tweets.append({
-                "text": text,
-                "link": link,
-                "images": images,
-                "video": video_url,
-                "quote": quote,
-                "display_name": display_name,
-                "username": username
-            })
+        logger.info(f"✅ @{username}: {len(tweets)} твитов загружено")
+        return display_name, tweets
 
-    return display_name, tweets
-
-async def fetch_tweets(username):
-    mirrors = MIRRORS.copy()
-    random.shuffle(mirrors)
-    for mirror in mirrors:
-        try:
-            display_name, tweets = await try_fetch_from_mirror(mirror, username)
-            if tweets or display_name != username:
-                logger.info(f"✅ @{username} через {mirror}")
-                return display_name, tweets
-        except httpx.HTTPStatusError as e:
-            logger.warning(f"⚠️ {mirror} -> {e.response.status_code} для @{username}")
-        except Exception as e:
-            logger.warning(f"⚠️ {mirror} -> {e} для @{username}")
-    logger.error(f"❌ Все зеркала недоступны для @{username}")
-    return username, []
+    except Exception as e:
+        logger.error(f"❌ @{username}: {e}")
+        return username, []
 
 async def mark_all_current_as_sent(username):
-    """Отмечает ВСЕ текущие посты как отправленные."""
-    _, tweets = await fetch_tweets(username)
-    sent_posts = load_sent_posts()
-    count = 0
-    for tweet in tweets:
-        link = tweet["link"]
-        if link not in sent_posts:
-            sent_posts.add(link)
-            save_sent_post(link)
-            count += 1
-    logger.info(f"📌 @{username}: {count} постов отмечено как прочитанные")
-    return count
+    """До 3 попыток отметить все текущие посты."""
+    for attempt in range(3):
+        _, tweets = await fetch_tweets(username)
+        if tweets:
+            sent_posts = load_sent_posts()
+            count = 0
+            for tweet in tweets:
+                link = tweet["link"]
+                if link not in sent_posts:
+                    sent_posts.add(link)
+                    save_sent_post(link)
+                    count += 1
+            logger.info(f"📌 @{username}: {count} постов отмечено (попытка {attempt+1})")
+            return count
+        await asyncio.sleep(3)
+    logger.warning(f"⚠️ @{username}: не удалось загрузить твиты после 3 попыток")
+    return 0
 
 # --- АДМИН-КОМАНДЫ ---
 def is_admin(user_id):
@@ -272,7 +257,6 @@ async def cmd_addfan(update, context):
     fans = load_fans()
     if username in fans:
         await update.message.reply_text(f"⚠️ @{username} уже в фан-каналах."); return
-
     async with adding_lock:
         await update.message.reply_text(f"⏳ Добавляю @{username}...")
         try:
@@ -294,11 +278,10 @@ async def cmd_addmanyfan(update, context):
     usernames = list(dict.fromkeys(mentions + links))
     if not usernames:
         await update.message.reply_text("❌ Не удалось распознать username."); return
-
     async with adding_lock:
         fans = load_fans()
         added, skipped, failed = [], [], []
-        await update.message.reply_text(f"⏳ Обрабатываю {len(usernames)} каналов (может занять до минуты)...")
+        await update.message.reply_text(f"⏳ Обрабатываю {len(usernames)} каналов...")
         for username in usernames:
             if username in fans:
                 skipped.append(f"• @{username}")
@@ -347,7 +330,6 @@ async def cmd_addblogger(update, context):
         await update.message.reply_text(f"⚠️ @{username} уже в блогерах."); return
     keywords = load_keywords()
     kw_msg = f"🔑 Слова: {', '.join(keywords)}" if keywords else "⚠️ Слов нет — репостится всё!"
-
     async with adding_lock:
         await update.message.reply_text(f"⏳ Добавляю @{username}...\n{kw_msg}")
         try:
@@ -369,7 +351,6 @@ async def cmd_addmanyblogger(update, context):
     usernames = list(dict.fromkeys(mentions + links))
     if not usernames:
         await update.message.reply_text("❌ Не удалось распознать username."); return
-
     async with adding_lock:
         bloggers = load_bloggers()
         keywords = load_keywords()
@@ -524,7 +505,7 @@ async def send_post(bot: Bot, tweet, username):
 
 async def check_and_post(bot: Bot):
     async with adding_lock:
-        pass  # Ждём, если идёт добавление
+        pass
 
     fans = load_fans()
     bloggers = load_bloggers()
@@ -544,7 +525,7 @@ async def check_and_post(bot: Bot):
             save_sent_post(tweet["link"])
             sent_posts.add(tweet["link"])
             new_posts += 1
-            await asyncio.sleep(3)  # Увеличенная пауза против флуда
+            await asyncio.sleep(3)
 
     for username in bloggers:
         try:
@@ -569,7 +550,7 @@ async def check_and_post(bot: Bot):
     return new_posts
 
 async def scheduled_check(bot: Bot):
-    await asyncio.sleep(10)  # Даём боту время на инициализацию
+    await asyncio.sleep(10)
     while True:
         try:
             await check_and_post(bot)
