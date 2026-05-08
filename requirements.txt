@@ -1,6 +1,4 @@
 feedparser==6.0.11
 python-telegram-bot[job-queue]==20.8
 httpx
-beautifulsoup4
-lxml
 nest_asyncio
