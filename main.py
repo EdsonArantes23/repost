@@ -2,9 +2,11 @@ import asyncio
 import os
 import logging
 import re
+import time
 from datetime import datetime
 
 import httpx
+import nest_asyncio
 from bs4 import BeautifulSoup
 from telegram import Bot, InputMediaPhoto
 from telegram.error import TelegramError
@@ -15,9 +17,9 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # --- НАСТРОЙКИ (ЖЁСТКО В КОДЕ) ---
-TELEGRAM_BOT_TOKEN = os.getenv("BOT_TOKEN")  # Bothost пробрасывает сам
-TELEGRAM_CHANNEL_ID = -1003857194781         # Ваш канал
-ADMIN_ID = 417850992                         # Ваш Telegram ID
+TELEGRAM_BOT_TOKEN = os.getenv("BOT_TOKEN")
+TELEGRAM_CHANNEL_ID = -1003857194781
+ADMIN_ID = 417850992
 
 SENT_POSTS_FILE = "sent_posts.txt"
 ACCOUNTS_FILE = "x_accounts.txt"
@@ -268,11 +270,11 @@ async def check_and_post(bot: Bot):
                         await bot.send_photo(
                             chat_id=TELEGRAM_CHANNEL_ID,
                             photo=images[0],
-                            caption=full_text[:1024]  # Telegram limit for caption
+                            caption=full_text[:1024]
                         )
                     else:
                         media = []
-                        for i, img_url in enumerate(images[:10]):  # Max 10 photos
+                        for i, img_url in enumerate(images[:10]):
                             if i == 0:
                                 media.append(InputMediaPhoto(
                                     media=img_url,
@@ -299,7 +301,6 @@ async def check_and_post(bot: Bot):
 
             except TelegramError as e:
                 logger.error(f"Ошибка отправки: {e}")
-                # Пробуем без фото
                 try:
                     await bot.send_message(
                         chat_id=TELEGRAM_CHANNEL_ID,
@@ -320,7 +321,7 @@ async def scheduled_check(bot: Bot):
             await check_and_post(bot)
         except Exception as e:
             logger.error(f"Ошибка в цикле: {e}")
-        await asyncio.sleep(120)  # Каждые 2 минуты
+        await asyncio.sleep(120)
 
 # --- ЗАПУСК ---
 async def main():
@@ -350,4 +351,14 @@ async def main():
     await app.run_polling()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    nest_asyncio.apply()
+
+    try:
+        loop = asyncio.get_running_loop()
+        logger.info("Используем существующий event loop")
+        loop.create_task(main())
+        while True:
+            time.sleep(3600)
+    except RuntimeError:
+        logger.info("Создаём новый event loop")
+        asyncio.run(main())
