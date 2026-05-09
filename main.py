@@ -1,37 +1,62 @@
 import asyncio
-import os
 import logging
+import os
 import re
 import time
+import feedparser
 import httpx
 import nest_asyncio
-import feedparser
 from telegram import Bot, InputMediaPhoto
 from telegram.error import TelegramError
 from telegram.ext import Application, CommandHandler
 
-# --- ЛОГИ ---
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+# =========================================================
+# LOGGING
+# =========================================================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+logger = logging.getLogger(__name__)  # ✅ FIX: __name__ вместо name
 
-# --- НАСТРОЙКИ ---
+# =========================================================
+# CONFIG
+# =========================================================
 TELEGRAM_BOT_TOKEN = os.getenv("BOT_TOKEN")
 TELEGRAM_CHANNEL_ID = -1003857194781
 ADMIN_ID = 417850992
+# ✅ FIX: cacheTime=60 уменьшает кэш RSSHub с 5 мин до ~1 мин
 RSSHUB_URL = "https://chelsea-rss-bridge.onrender.com?cacheTime=60"
 CHECK_INTERVAL = 15
+MAX_CONCURRENT_REQUESTS = 25
 SENT_POSTS_FILE = "sent_posts.txt"
 FANS_FILE = "chelsea_fans.txt"
 BLOGGERS_FILE = "general_bloggers.txt"
 KEYWORDS_FILE = "keywords.txt"
 
-# ✅ ПРИ ПЕРВОМ ЗАПУСКЕ: не отправлять старые посты
-WARMUP_MODE = True
-
+# =========================================================
+# GLOBAL
+# =========================================================
 sent_posts_cache = set()
 adding_lock = asyncio.Lock()
+semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
 
-# --- ФАЙЛЫ ---
+# =========================================================
+# GLOBAL HTTP CLIENT
+# =========================================================
+client = httpx.AsyncClient(
+    timeout=httpx.Timeout(20.0, connect=10.0),
+    follow_redirects=True,
+    http2=True,
+    headers={
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "Accept": "application/rss+xml, */*"
+    }
+)
+
+# =========================================================
+# FILES
+# =========================================================
 def load_list(filename):
     try:
         with open(filename, "r", encoding="utf-8") as f:
@@ -69,23 +94,33 @@ def save_sent_post(post_id):
     with open(SENT_POSTS_FILE, "a", encoding="utf-8") as f:
         f.write(post_id + "\n")
 
-# --- УТИЛИТЫ ---
-def is_admin(user_id): return user_id == ADMIN_ID
+# =========================================================
+# UTILS
+# =========================================================
+def is_admin(user_id):
+    return user_id == ADMIN_ID
 
 def post_matches_filter(text, keywords):
-    if not keywords: return True
-    text_lower = text.lower()
-    return any(kw.lower() in text_lower for kw in keywords)
+    if not keywords:
+        return True
+    text = text.lower()
+    return any(kw.lower() in text for kw in keywords)
 
 def clean_html(text):
-    if not text: return ""
     text = re.sub(r'<[^>]+>', '', text)
-    text = text.replace('&lt;', '<').replace('&gt;', '>').replace('&amp;', '&')
-    text = text.replace('&#39;', "'").replace('&quot;', '"')
-    return re.sub(r'\n\s*\n', '\n\n', text).strip()
+    text = (text.replace('&lt;', '<')
+               .replace('&gt;', '>')
+               .replace('&amp;', '&')
+               .replace('&quot;', '"')
+               .replace('&#39;', "'"))
+    text = re.sub(r'\n\s*\n', '\n\n', text)
+    return text.strip()
 
 def extract_text_and_media(entry):
-    images, videos, text = [], [], ""
+    images = []
+    videos = []
+    text = ""
+    
     description = getattr(entry, "description", "") or getattr(entry, "summary", "")
     
     if description:
@@ -113,101 +148,81 @@ def extract_text_and_media(entry):
                 videos.append(url)
                 
     if not text:
-        title = getattr(entry, "title", "") or ""
+        title = getattr(entry, "title", "")
         text = clean_html(title)
         
     return text, images, videos
 
-# --- FETCH ---
+# =========================================================
+# FETCH
+# =========================================================
 async def fetch_tweets(username):
-    url = f"{RSSHUB_URL}/twitter/user/{username}"
-    logger.debug(f"🔍 @{username}: запрос к {url}")
-    
-    for attempt in range(2):
-        try:
-            async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
-                headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/rss+xml, */*"}
-                response = await client.get(url, headers=headers)
-                
-                logger.debug(f"🔍 @{username}: статус {response.status_code}, размер ответа: {len(response.text)} байт")
+    async with semaphore:
+        url = f"{RSSHUB_URL}/twitter/user/{username}"
+        
+        for attempt in range(3):
+            try:
+                response = await client.get(url)
                 
                 if response.status_code == 503:
-                    wait = 3 if attempt == 0 else 5
-                    logger.warning(f"⚠️ @{username}: 503, попытка {attempt+1}/2, жду {wait} сек")
-                    await asyncio.sleep(wait)
+                    wait_time = 2 * (attempt + 1)
+                    logger.warning(f"⚠️ @{username}: 503, retry {attempt+1}/3")
+                    await asyncio.sleep(wait_time)
                     continue
                     
                 response.raise_for_status()
-                
-                # ✅ DEBUG: покажем, что пришло от RSSHub
-                if response.text.count('<item>') == 0:
-                    logger.warning(f"⚠️ @{username}: RSSHub вернул 200, но НЕТ <item>! Начало ответа: {response.text[:300]}")
-                
                 feed = feedparser.parse(response.text)
-                logger.debug(f"🔍 @{username}: feedparser нашёл {len(feed.entries)} записей")
                 
                 display_name = username
                 if hasattr(feed.feed, "title"):
                     display_name = feed.feed.title.replace("Twitter @", "").strip()
                     
                 tweets = []
-                for i, entry in enumerate(feed.entries):
-                    try:
-                        text, images, videos = extract_text_and_media(entry)
-                        link = getattr(entry, "link", "")
-                        
-                        # ✅ FIX: надёжный ключ — извлекаем ID твита или делаем fallback
-                        match = re.search(r'/status/(\d+)', link)
-                        tweet_id = match.group(1) if match else (link or f"{username}:{text[:30]}")
-                        
-                        logger.debug(f"🔍 @{username} entry#{i}: tweet_id={tweet_id[:20]}..., text_len={len(text)}, images={len(images)}, videos={len(videos)}")
-                        
-                        tweets.append({
-                            "text": text, "link": link, "tweet_id": tweet_id,
-                            "images": images, "videos": videos,
-                            "display_name": display_name, "username": username
-                        })
-                    except Exception as e:
-                        logger.error(f"❌ @{username}: ошибка парсинга entry#{i}: {e}")
-                        continue
-                        
-                logger.info(f"✅ @{username}: распарсено {len(tweets)} твитов")
-                return display_name, tweets
+                for entry in feed.entries:
+                    text, images, videos = extract_text_and_media(entry)
+                    link = getattr(entry, "link", "")
+                    
+                    # ✅ FIX: надёжный ключ дедупликации
+                    match = re.search(r'/status/(\d+)', link)
+                    tweet_id = match.group(1) if match else link
+                    
+                    tweets.append({
+                        "tweet_id": tweet_id,
+                        "text": text,
+                        "link": link,
+                        "images": images,
+                        "videos": videos,
+                        "display_name": display_name,
+                        "username": username
+                    })
+                return tweets
                 
-        except httpx.HTTPStatusError as e:
-            logger.error(f"❌ @{username}: HTTP {e.response.status_code}")
-            if e.response.status_code != 503:
-                break
-            await asyncio.sleep(3)
-        except (httpx.ConnectTimeout, httpx.ReadTimeout):
-            logger.warning(f"⚠️ @{username}: таймаут, попытка {attempt+1}/2")
-            await asyncio.sleep(2)
-        except Exception as e:
-            logger.error(f"❌ @{username}: {type(e).__name__}: {e}")
-            break
-            
-    logger.error(f"❌ @{username}: не удалось после попыток")
-    return username, []
+            except Exception as e:
+                logger.error(f"❌ @{username}: {e}")
+                if attempt < 2:
+                    await asyncio.sleep(2)
+                    
+        return []
 
 async def fetch_all_tweets(usernames):
-    tasks = [fetch_tweets(u) for u in usernames]
+    tasks = [fetch_tweets(username) for username in usernames]
     results = await asyncio.gather(*tasks, return_exceptions=True)
     
     all_tweets = []
-    for res in results:
-        if isinstance(res, Exception):
-            logger.error(f"❌ Ошибка при параллельной проверке: {res}")
+    for result in results:
+        if isinstance(result, Exception):
+            logger.error(result)
             continue
-        if not isinstance(res, tuple) or len(res) != 2:
-            continue
-        _, tweets = res
-        if tweets:
-            all_tweets.extend(tweets)
+        if result:
+            all_tweets.extend(result)
     return all_tweets
 
-# --- TELEGRAM SEND ---
-async def send_post(bot: Bot, tweet, username):
+# =========================================================
+# TELEGRAM SEND
+# =========================================================
+async def send_post(bot: Bot, tweet):
     text = tweet["text"]
+    username = tweet["username"]
     signature = f"\n\n{tweet['display_name']} | https://x.com/{username}"
     full_text = text + signature
     images = tweet["images"]
@@ -215,65 +230,54 @@ async def send_post(bot: Bot, tweet, username):
     
     try:
         if videos:
-            # ✅ FIX: disable_web_page_preview убран (его нет в send_video)
+            # ✅ FIX: убран disable_web_page_preview (его нет в send_video)
             await bot.send_video(
-                TELEGRAM_CHANNEL_ID, video=videos[0],
-                caption=full_text[:1024], supports_streaming=True
+                TELEGRAM_CHANNEL_ID,
+                video=videos[0],
+                caption=full_text[:1024],
+                supports_streaming=True
             )
         elif images:
-            if len(images) == 1:
-                await bot.send_photo(TELEGRAM_CHANNEL_ID, images[0], caption=full_text[:1024])
-            else:
-                media = []
-                for i, img in enumerate(images[:10]):
-                    if i == 0:
-                        media.append(InputMediaPhoto(media=img, caption=full_text[:1024]))
-                    else:
-                        media.append(InputMediaPhoto(media=img))
-                await bot.send_media_group(TELEGRAM_CHANNEL_ID, media)
+            await bot.send_photo(
+                TELEGRAM_CHANNEL_ID,
+                images[0],
+                caption=full_text[:1024]
+            )
         else:
-            # ✅ Здесь параметр оставляем
-            await bot.send_message(TELEGRAM_CHANNEL_ID, full_text, disable_web_page_preview=True)
+            await bot.send_message(
+                TELEGRAM_CHANNEL_ID,
+                full_text[:4096],
+                disable_web_page_preview=True
+            )
         return True
     except TelegramError as e:
-        logger.error(f"❌ Ошибка отправки: {e}")
-        try:
-            await bot.send_message(TELEGRAM_CHANNEL_ID, full_text[:4096], disable_web_page_preview=True)
-            return True
-        except Exception as e2:
-            logger.error(f"❌ Фолбэк не сработал: {e2}")
-            return False
+        logger.error(f"Telegram error: {e}")
+        return False
 
-# --- CORE ---
-async def check_and_post(bot: Bot, warmup: bool = False):
-    global sent_posts_cache
-    async with adding_lock:
-        pass
+# =========================================================
+# CORE
+# =========================================================
+async def check_and_post(bot: Bot):
     fans = load_fans()
     bloggers = load_bloggers()
     all_usernames = list(set(fans + bloggers))
     
-    if not all_usernames: 
-        logger.info("⚠️ Нет аккаунтов для проверки")
+    if not all_usernames:
         return 0
-    if not sent_posts_cache: 
-        sent_posts_cache = load_sent_posts()
-        logger.info(f"📦 Загружено {len(sent_posts_cache)} ID из кэша")
-    
-    logger.info(f"🔄 Параллельная проверка {len(all_usernames)} каналов...")
-    start_time = time.time()
-    all_tweets = await fetch_all_tweets(all_usernames)
-    elapsed = time.time() - start_time
-    logger.info(f"⏱ Проверка заняла {elapsed:.1f} сек, получено {len(all_tweets)} твитов")
-    
+        
     keywords = load_keywords()
-    new_posts = 0
+    logger.info(f"🔄 Проверка {len(all_usernames)} аккаунтов...")
     
+    start = time.time()
+    all_tweets = await fetch_all_tweets(all_usernames)
+    elapsed = round(time.time() - start, 1)
+    logger.info(f"⏱ Получено {len(all_tweets)} твитов за {elapsed} сек")
+    
+    all_tweets.sort(key=lambda x: int(x["tweet_id"]) if str(x["tweet_id"]).isdigit() else 0, reverse=True)
+    
+    new_posts = 0
     for tweet in all_tweets:
-        tweet_id = tweet.get("tweet_id") or tweet.get("link")
-        if not tweet_id:
-            logger.warning(f"⚠️ Пропущен твит без ID: {tweet.get('username')}")
-            continue
+        tweet_id = tweet["tweet_id"]
         if tweet_id in sent_posts_cache:
             continue
             
@@ -281,256 +285,187 @@ async def check_and_post(bot: Bot, warmup: bool = False):
         if username in bloggers and username not in fans:
             if not post_matches_filter(tweet["text"], keywords):
                 continue
-        
-        # ✅ В режиме прогрева только заполняем кэш, не шлём в ТГ
-        if not warmup:
-            success = await send_post(bot, tweet, username)
-            if success:
-                logger.info(f"📨 @{username} | ID: {tweet_id[:20]}...")
-                new_posts += 1
-                await asyncio.sleep(0.5)
+                
+        success = await send_post(bot, tweet)
+        if success:
+            save_sent_post(tweet_id)
+            new_posts += 1
+            logger.info(f"✅ Отправлен @{username}")
+            await asyncio.sleep(0.5)
             
-        save_sent_post(tweet_id)
-        
     if new_posts:
-        logger.info(f"✅ Отправлено {new_posts} новых постов")
+        logger.info(f"📤 Новых постов: {new_posts}")
     return new_posts
 
-async def scheduled_check(bot: Bot):
-    global WARMUP_MODE
-    if WARMUP_MODE:
-        logger.info("🔥 WARMUP MODE: заполняю кэш, НЕ отправляю старые посты")
-        await check_and_post(bot, warmup=True)
-        WARMUP_MODE = False
-        logger.info("✅ Кэш заполнен. Теперь будут отправляться ТОЛЬКО новые посты")
-        await asyncio.sleep(5)
-        
+async def scheduled_check(bot):
     await asyncio.sleep(5)
     while True:
         try:
-            await check_and_post(bot, warmup=False)
+            await check_and_post(bot)
         except Exception as e:
-            logger.error(f"❌ Цикл: {e}", exc_info=True)
+            logger.error(f"Loop error: {e}")
         await asyncio.sleep(CHECK_INTERVAL)
 
-# --- КОМАНДЫ ---
+# =========================================================
+# COMMANDS
+# =========================================================
 async def cmd_start(update, context):
     if not is_admin(update.effective_user.id): return
-    await update.message.reply_text("👋 Бот готов. /status, /force, /addfan, /addblogger...")
+    await update.message.reply_text("🤖 Бот работает.\nКоманды: /status, /force, /addfan, /addblogger, /addword")
 
 async def cmd_addfan(update, context):
     if not is_admin(update.effective_user.id): return
     if not context.args: await update.message.reply_text("❌ /addfan @username"); return
     username = context.args[0].strip().lstrip("@")
     fans = load_fans()
-    if username in fans: await update.message.reply_text(f"⚠️ @{username} уже в фан-каналах."); return
-    async with adding_lock:
-        await update.message.reply_text(f"⏳ Добавляю @{username}...")
-        try:
-            display_name, _ = await fetch_tweets(username)
-            fans.append(username)
-            save_fans(fans)
-            count = await mark_all_current_as_sent(username)
-            await update.message.reply_text(f"✅ {display_name} (@{username}) добавлен.\n📤 {count} постов пропущено.")
-        except Exception as e:
-            logger.exception(f"❌ Ошибка в cmd_addfan: {e}")
-            await update.message.reply_text(f"❌ Ошибка: {e}")
+    if username in fans: await update.message.reply_text(f"⚠️ @{username} уже есть"); return
+    tweets = await fetch_tweets(username)
+    fans.append(username)
+    save_fans(fans)
+    for t in tweets: save_sent_post(t["tweet_id"])
+    await update.message.reply_text(f"✅ @{username} добавлен | пропущено {len(tweets)} старых")
 
 async def cmd_addmanyfan(update, context):
     if not is_admin(update.effective_user.id): return
     if not context.args: await update.message.reply_text("❌ /addmanyfan ссылки"); return
-    raw_input = " ".join(context.args)
-    mentions = re.findall(r'@(\w+)', raw_input)
-    links = re.findall(r'https?://(?:x.com|twitter.com)/(\w+)', raw_input)
-    usernames = list(dict.fromkeys(mentions + links))
-    if not usernames: await update.message.reply_text("❌ Не удалось распознать username."); return
-    async with adding_lock:
-        fans = load_fans()
-        added, skipped, failed = [], [], []
-        await update.message.reply_text(f"⏳ Обрабатываю {len(usernames)} каналов...")
-        for username in usernames:
-            if username in fans: skipped.append(f"• @{username}"); continue
-            try:
-                display_name, _ = await fetch_tweets(username)
-                fans.append(username)
-                save_fans(fans)
-                count = await mark_all_current_as_sent(username)
-                added.append(f"✅ {display_name} (@{username}) — {count} пропущено")
-            except Exception as e:
-                logger.exception(f"❌ Ошибка при добавлении @{username}: {e}")
-                failed.append(f"❌ @{username}")
-            await asyncio.sleep(0.3)
-        report = []
-        if added: report.append(f"✨ Добавлены ({len(added)}):\n" + "\n".join(added))
-        if skipped: report.append(f"⚠️ Уже были ({len(skipped)}):\n" + "\n".join(skipped))
-        if failed: report.append(f"❌ Не удалось ({len(failed)}):\n" + "\n".join(failed))
-        await update.message.reply_text("\n\n".join(report) if report else "Ничего не изменилось.")
+    text = update.message.text
+    usernames = set(re.findall(r'@([A-Za-z0-9_]+)', text) + re.findall(r'https?://(?:x\.com|twitter\.com)/([A-Za-z0-9_]+)', text, flags=re.IGNORECASE))
+    if not usernames: await update.message.reply_text("❌ Не удалось распознать usernames"); return
+    fans = load_fans()
+    added, skipped = [], []
+    for u in usernames:
+        if u in fans: skipped.append(u); continue
+        try:
+            tweets = await fetch_tweets(u)
+            fans.append(u)
+            save_fans(fans)
+            for t in tweets: save_sent_post(t["tweet_id"])
+            added.append(u)
+        except Exception as e: logger.error(e)
+        await asyncio.sleep(0.2)
+    msg = f"✅ Добавлены: {len(added)}\n⚠️ Уже были: {len(skipped)}"
+    await update.message.reply_text(msg)
 
 async def cmd_removefan(update, context):
     if not is_admin(update.effective_user.id): return
-    if not context.args: await update.message.reply_text("❌ /removefan @username"); return
+    if not context.args: return
     username = context.args[0].strip().lstrip("@")
     fans = load_fans()
-    if username not in fans: await update.message.reply_text(f"⚠️ @{username} не найден."); return
-    fans.remove(username)
-    save_fans(fans)
-    await update.message.reply_text(f"✅ @{username} удалён.")
+    if username not in fans: await update.message.reply_text("❌ Не найден"); return
+    fans.remove(username); save_fans(fans)
+    await update.message.reply_text(f"✅ @{username} удалён")
 
 async def cmd_listfan(update, context):
     if not is_admin(update.effective_user.id): return
     fans = load_fans()
-    if not fans: await update.message.reply_text("📋 Фан-каналы: пусто."); return
-    await update.message.reply_text("📋 Фан-каналы:\n" + "\n".join([f"• @{f}" for f in fans]))
+    if not fans: await update.message.reply_text("Пусто"); return
+    await update.message.reply_text("📋 Фан аккаунты:\n" + "\n".join(f"• @{f}" for f in fans))
 
 async def cmd_addblogger(update, context):
     if not is_admin(update.effective_user.id): return
-    if not context.args: await update.message.reply_text("❌ /addblogger @username"); return
+    if not context.args: return
     username = context.args[0].strip().lstrip("@")
     bloggers = load_bloggers()
-    if username in bloggers: await update.message.reply_text(f"⚠️ @{username} уже в блогерах."); return
-    keywords = load_keywords()
-    kw_msg = f"🔑 Слова: {', '.join(keywords)}" if keywords else "⚠️ Слов нет — репостится всё!"
-    async with adding_lock:
-        await update.message.reply_text(f"⏳ Добавляю @{username}...\n{kw_msg}")
-        try:
-            display_name, _ = await fetch_tweets(username)
-            bloggers.append(username)
-            save_bloggers(bloggers)
-            count = await mark_all_current_as_sent(username)
-            await update.message.reply_text(f"✅ {display_name} (@{username}) добавлен.\n📤 {count} постов пропущено.")
-        except Exception as e:
-            logger.exception(f"❌ Ошибка в cmd_addblogger: {e}")
-            await update.message.reply_text(f"❌ Ошибка: {e}")
+    if username in bloggers: await update.message.reply_text("⚠️ Уже есть"); return
+    tweets = await fetch_tweets(username)
+    bloggers.append(username); save_bloggers(bloggers)
+    for t in tweets: save_sent_post(t["tweet_id"])
+    await update.message.reply_text(f"✅ @{username} добавлен")
 
 async def cmd_addmanyblogger(update, context):
     if not is_admin(update.effective_user.id): return
-    if not context.args: await update.message.reply_text("❌ /addmanyblogger ссылки"); return
-    raw_input = " ".join(context.args)
-    mentions = re.findall(r'@(\w+)', raw_input)
-    links = re.findall(r'https?://(?:x.com|twitter.com)/(\w+)', raw_input)
-    usernames = list(dict.fromkeys(mentions + links))
-    if not usernames: await update.message.reply_text("❌ Не удалось распознать username."); return
-    async with adding_lock:
-        bloggers = load_bloggers()
-        keywords = load_keywords()
-        kw_msg = f"🔑 Слова: {', '.join(keywords)}" if keywords else "⚠️ Слов нет — репостится всё!"
-        added, skipped, failed = [], [], []
-        await update.message.reply_text(f"⏳ Обрабатываю {len(usernames)} блогеров...\n{kw_msg}")
-        for username in usernames:
-            if username in bloggers: skipped.append(f"• @{username}"); continue
-            try:
-                display_name, _ = await fetch_tweets(username)
-                bloggers.append(username)
-                save_bloggers(bloggers)
-                count = await mark_all_current_as_sent(username)
-                added.append(f"✅ {display_name} (@{username}) — {count} пропущено")
-            except Exception as e:
-                logger.exception(f"❌ Ошибка при добавлении блогера @{username}: {e}")
-                failed.append(f"❌ @{username}")
-            await asyncio.sleep(0.3)
-        report = []
-        if added: report.append(f"✨ Добавлены ({len(added)}):\n" + "\n".join(added))
-        if skipped: report.append(f"⚠️ Уже были ({len(skipped)}):\n" + "\n".join(skipped))
-        if failed: report.append(f"❌ Не удалось ({len(failed)}):\n" + "\n".join(failed))
-        await update.message.reply_text("\n\n".join(report) if report else "Ничего не изменилось.")
+    if not context.args: return
+    text = update.message.text
+    usernames = set(re.findall(r'@([A-Za-z0-9_]+)', text) + re.findall(r'https?://(?:x\.com|twitter\.com)/([A-Za-z0-9_]+)', text, flags=re.IGNORECASE))
+    bloggers = load_bloggers()
+    added = []
+    for u in usernames:
+        if u in bloggers: continue
+        try:
+            tweets = await fetch_tweets(u)
+            bloggers.append(u); save_bloggers(bloggers)
+            for t in tweets: save_sent_post(t["tweet_id"])
+            added.append(u)
+        except: pass
+        await asyncio.sleep(0.2)
+    await update.message.reply_text(f"✅ Добавлено {len(added)} блогеров")
 
 async def cmd_removeblogger(update, context):
     if not is_admin(update.effective_user.id): return
-    if not context.args: await update.message.reply_text("❌ /removeblogger @username"); return
+    if not context.args: return
     username = context.args[0].strip().lstrip("@")
     bloggers = load_bloggers()
-    if username not in bloggers: await update.message.reply_text(f"⚠️ @{username} не найден."); return
-    bloggers.remove(username)
-    save_bloggers(bloggers)
-    await update.message.reply_text(f"✅ @{username} удалён.")
+    if username not in bloggers: return
+    bloggers.remove(username); save_bloggers(bloggers)
+    await update.message.reply_text(f"✅ @{username} удалён")
 
 async def cmd_listbloggers(update, context):
     if not is_admin(update.effective_user.id): return
     bloggers = load_bloggers()
-    keywords = load_keywords()
-    kw_msg = f"🔑 Слова: {', '.join(keywords)}" if keywords else "⚠️ Слов нет"
-    if not bloggers: await update.message.reply_text(f"📋 Блогеры: пусто.\n{kw_msg}"); return
-    await update.message.reply_text(f"📋 Блогеры:\n" + "\n".join([f"• @{b}" for b in bloggers]) + f"\n\n{kw_msg}")
+    if not bloggers: await update.message.reply_text("Пусто"); return
+    await update.message.reply_text("📋 Блогеры:\n" + "\n".join(f"• @{b}" for b in bloggers))
 
 async def cmd_addword(update, context):
     if not is_admin(update.effective_user.id): return
-    if not context.args: await update.message.reply_text("❌ /addword слово"); return
-    word = context.args[0].strip().lower()
+    if not context.args: return
+    word = context.args[0].lower()
     keywords = load_keywords()
-    if word in keywords: await update.message.reply_text(f"⚠️ '{word}' уже в списке."); return
-    keywords.append(word)
-    save_keywords(keywords)
-    await update.message.reply_text(f"✅ '{word}' добавлен. Всего: {len(keywords)}")
+    if word in keywords: return
+    keywords.append(word); save_keywords(keywords)
+    await update.message.reply_text(f"✅ '{word}' добавлено")
 
 async def cmd_addwords(update, context):
     if not is_admin(update.effective_user.id): return
-    if not context.args: await update.message.reply_text("❌ /addwords слово1 слово2 ..."); return
-    raw_input = " ".join(context.args)
-    words = re.split(r'[,\s;\n]+', raw_input)
-    words = [w.strip().lower() for w in words if w.strip()]
-    if not words: await update.message.reply_text("❌ Не удалось распознать слова."); return
+    text = " ".join(context.args)
+    words = [w.strip().lower() for w in re.split(r"[,\s;\n]+", text) if w.strip()]
     keywords = load_keywords()
-    added, skipped = [], []
-    for word in words:
-        if word in keywords: skipped.append(word)
-        else: keywords.append(word); added.append(word)
+    added = [w for w in words if w not in keywords and not keywords.append(w)]
     save_keywords(keywords)
-    report = []
-    if added: report.append(f"✅ Добавлены ({len(added)}): {', '.join(added)}")
-    if skipped: report.append(f"⚠️ Уже были ({len(skipped)}): {', '.join(skipped)}")
-    await update.message.reply_text("\n".join(report) + f"\n\n🔑 Всего: {len(keywords)}")
+    await update.message.reply_text(f"✅ Добавлено {len(added)} слов")
 
 async def cmd_removeword(update, context):
     if not is_admin(update.effective_user.id): return
-    if not context.args: await update.message.reply_text("❌ /removeword слово"); return
-    word = context.args[0].strip().lower()
+    if not context.args: return
+    word = context.args[0].lower()
     keywords = load_keywords()
-    if word not in keywords: await update.message.reply_text(f"⚠️ '{word}' не найден."); return
-    keywords.remove(word)
-    save_keywords(keywords)
-    await update.message.reply_text(f"✅ '{word}' удалён. Всего: {len(keywords)}")
+    if word not in keywords: return
+    keywords.remove(word); save_keywords(keywords)
+    await update.message.reply_text(f"✅ '{word}' удалено")
 
 async def cmd_listwords(update, context):
     if not is_admin(update.effective_user.id): return
     keywords = load_keywords()
-    if not keywords: await update.message.reply_text("🔑 Ключевых слов нет."); return
-    await update.message.reply_text(f"🔑 Ключевые слова ({len(keywords)}):\n" + ", ".join(keywords))
+    if not keywords: await update.message.reply_text("Слов нет"); return
+    await update.message.reply_text("🔑 Ключевые слова:\n" + ", ".join(keywords))
 
 async def cmd_status(update, context):
     if not is_admin(update.effective_user.id): return
     fans = load_fans()
     bloggers = load_bloggers()
     keywords = load_keywords()
-    sent = len(sent_posts_cache)
-    await update.message.reply_text(
-        f"✅ Бот активен\n📡 @chelsea_news_insider\n🔵 Фан-каналов: {len(fans)}\n🟡 Блогеров: {len(bloggers)}\n🔑 Слов: {len(keywords)}\n📤 Постов: {sent}"
-    )
+    await update.message.reply_text(f"✅ ONLINE\n\n🔵 Fans: {len(fans)}\n🟡 Bloggers: {len(bloggers)}\n🔑 Words: {len(keywords)}\n📤 Sent: {len(sent_posts_cache)}")
 
 async def cmd_force(update, context):
     if not is_admin(update.effective_user.id): return
     await update.message.reply_text("🔄 Проверка...")
-    count = await check_and_post(context.bot, warmup=False)
-    await update.message.reply_text(f"✅ Отправлено: {count} постов.")
+    count = await check_and_post(context.bot)
+    await update.message.reply_text(f"✅ Отправлено: {count}")
 
-async def mark_all_current_as_sent(username):
-    _, tweets = await fetch_tweets(username)
-    count = 0
-    for t in tweets:
-        save_sent_post(t.get("tweet_id") or t.get("link"))
-        count += 1
-    return count
-
-# --- MAIN ---
+# =========================================================
+# MAIN
+# =========================================================
 async def main():
     global sent_posts_cache
     if not TELEGRAM_BOT_TOKEN:
-        logger.critical("❌ Нет BOT_TOKEN!")
+        logger.critical("❌ Нет BOT_TOKEN")
         return
+        
     sent_posts_cache = load_sent_posts()
     bot = Bot(token=TELEGRAM_BOT_TOKEN)
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_start))
     app.add_handler(CommandHandler("addfan", cmd_addfan))
     app.add_handler(CommandHandler("addmanyfan", cmd_addmanyfan))
     app.add_handler(CommandHandler("removefan", cmd_removefan))
@@ -547,9 +482,12 @@ async def main():
     app.add_handler(CommandHandler("force", cmd_force))
     
     asyncio.create_task(scheduled_check(bot))
-    logger.info("🤖 Бот запущен")
+    logger.info("🤖 БОТ ЗАПУЩЕН | Интервал: 15 сек | RSSHub: cacheTime=60")
     await app.run_polling()
 
-if __name__ == "__main__":
+# =========================================================
+# START
+# =========================================================
+if __name__ == "__main__":  # ✅ FIX: __name__ вместо name
     nest_asyncio.apply()
     asyncio.run(main())
