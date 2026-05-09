@@ -126,15 +126,15 @@ async def fetch_tweets(username):
     """Получает твиты с повторными попытками при ошибках."""
     url = f"{RSSHUB_URL}/twitter/user/{username}"
 
-    for attempt in range(3):
+    for attempt in range(2):  # 2 попытки вместо 3 — быстрее
         try:
-            async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+            async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
                 headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/rss+xml, */*"}
                 response = await client.get(url, headers=headers)
 
                 if response.status_code == 503:
-                    wait = 5 if attempt == 0 else 10
-                    logger.warning(f"⚠️ @{username}: 503, попытка {attempt+1}/3, жду {wait} сек...")
+                    wait = 3 if attempt == 0 else 5
+                    logger.warning(f"⚠️ @{username}: 503, попытка {attempt+1}/2, жду {wait} сек...")
                     await asyncio.sleep(wait)
                     continue
 
@@ -159,20 +159,20 @@ async def fetch_tweets(username):
 
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 503:
-                wait = 5 if attempt == 0 else 10
-                logger.warning(f"⚠️ @{username}: 503, попытка {attempt+1}/3, жду {wait} сек...")
+                wait = 3 if attempt == 0 else 5
+                logger.warning(f"⚠️ @{username}: 503, попытка {attempt+1}/2, жду {wait} сек...")
                 await asyncio.sleep(wait)
             else:
                 logger.error(f"❌ @{username}: HTTP {e.response.status_code}")
                 break
         except (httpx.ConnectTimeout, httpx.ReadTimeout):
-            logger.warning(f"⚠️ @{username}: таймаут, попытка {attempt+1}/3")
-            await asyncio.sleep(3)
+            logger.warning(f"⚠️ @{username}: таймаут, попытка {attempt+1}/2")
+            await asyncio.sleep(2)
         except Exception as e:
             logger.error(f"❌ @{username}: {type(e).__name__}: {e}")
             break
 
-    logger.error(f"❌ @{username}: не удалось после 3 попыток")
+    logger.error(f"❌ @{username}: не удалось после 2 попыток")
     return username, []
 
 async def fetch_all_tweets(usernames):
@@ -188,7 +188,6 @@ async def fetch_all_tweets(usernames):
         display_name, tweets = result
         if tweets:
             all_tweets.extend(tweets)
-            logger.info(f"📦 {display_name}: {len(tweets)} твитов")
 
     return all_tweets
 
@@ -449,7 +448,7 @@ async def check_and_post(bot: Bot):
 
     fans = load_fans()
     bloggers = load_bloggers()
-    all_usernames = list(set(fans + bloggers))  # Убираем дубли, если канал в обоих списках
+    all_usernames = list(set(fans + bloggers))
 
     if not all_usernames:
         return 0
@@ -457,14 +456,12 @@ async def check_and_post(bot: Bot):
     if not sent_posts_cache:
         sent_posts_cache = load_sent_posts()
 
-    # Параллельная проверка всех каналов
     logger.info(f"🔄 Параллельная проверка {len(all_usernames)} каналов...")
     start_time = time.time()
     all_tweets = await fetch_all_tweets(all_usernames)
     elapsed = time.time() - start_time
     logger.info(f"⏱ Проверка заняла {elapsed:.1f} сек, получено {len(all_tweets)} твитов")
 
-    # Отправка новых постов
     keywords = load_keywords()
     new_posts = 0
 
@@ -473,7 +470,6 @@ async def check_and_post(bot: Bot):
         if link in sent_posts_cache:
             continue
 
-        # Фильтр для блогеров
         username = tweet["username"]
         if username in bloggers and username not in fans:
             if not post_matches_filter(tweet["text"], keywords):
@@ -495,7 +491,7 @@ async def scheduled_check(bot: Bot):
             await check_and_post(bot)
         except Exception as e:
             logger.error(f"Цикл: {e}")
-        await asyncio.sleep(45)
+        await asyncio.sleep(30)
 
 async def main():
     global sent_posts_cache
@@ -521,7 +517,7 @@ async def main():
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("force", cmd_force))
     asyncio.create_task(scheduled_check(bot))
-    logger.info("🤖 Бот запущен через RSSHub (параллельный режим)")
+    logger.info("🤖 Бот запущен (параллельный + быстрый режим)")
     await app.run_polling()
 
 if __name__ == "__main__":
