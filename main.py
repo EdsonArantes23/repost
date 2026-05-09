@@ -136,9 +136,6 @@ async def fetch_tweets(username):
                 response.raise_for_status()
                 feed = feedparser.parse(response.text)
                 
-                # ✅ DEBUG: покажем, что пришло от RSSHub
-                logger.debug(f"@{username}: feed.entries = {len(feed.entries)} шт.")
-                
                 display_name = username
                 if hasattr(feed.feed, "title"):
                     display_name = feed.feed.title.replace("Twitter @", "").strip()
