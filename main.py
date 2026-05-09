@@ -80,42 +80,37 @@ def clean_html(text):
     text = re.sub(r'<[^>]+>', '', text)
     text = text.replace('&lt;', '<').replace('&gt;', '>').replace('&amp;', '&')
     text = text.replace('&#39;', "'").replace('&quot;', '"')
-    return text.strip()
+    # Убираем множественные пробелы и пустые строки
+    text = re.sub(r'\n\s*\n', '\n\n', text)
+    text = text.strip()
+    return text
 
 def extract_text_and_media(entry):
-    """Извлекает текст, картинки и видео из RSS-записи."""
+    """Извлекает ПОЛНЫЙ текст, картинки и видео из RSS-записи."""
     images = []
     videos = []
     text = ""
 
-    # Получаем description (самый полный источник)
     description = getattr(entry, "description", "") or getattr(entry, "summary", "")
-    
-    # Пробуем title (может быть обрезан)
-    title = getattr(entry, "title", "") or ""
 
     if description:
-        # Убираем quote-блок (чужой твит) — он после <hr> или внутри <div class="rsshub-quote">
+        # Убираем quote-блок (чужой твит)
         clean_desc = re.split(r'<hr[^>]*>|<div class="rsshub-quote">', description)[0]
 
-        # Извлекаем текст (всё до первого <br> или <img> или <video>)
-        # Берём первую строку, которая является текстом твита
-        text_match = re.match(r'^([^<]*)', clean_desc)
-        if text_match:
-            text = clean_html(text_match.group(1))
-        
-        # Если текст пустой, пробуем title
-        if not text and title:
-            text = clean_html(title)
+        # Заменяем <br> на перенос строки ДО очистки от тегов
+        text_with_breaks = re.sub(r'<br\s*/?>', '\n', clean_desc)
 
-        # Картинки из img тегов (кроме тех, что в quote)
+        # Убираем все HTML-теги, оставляя текст
+        text = clean_html(text_with_breaks)
+
+        # Картинки из img тегов
         img_urls = re.findall(r'<img[^>]+src="([^"]+)"', clean_desc)
         for url in img_urls:
             url = url.replace("&amp;", "&")
             if url not in images and "pbs.twimg.com" in url:
                 images.append(url)
 
-        # Прямые ссылки на pbs.twimg.com (если img теги не нашлись)
+        # Прямые ссылки на pbs.twimg.com (запасной вариант)
         if not images:
             direct_urls = re.findall(r'https?://pbs\.twimg\.com/media/[^\s"\'&]+', description)
             for url in direct_urls:
@@ -130,8 +125,9 @@ def extract_text_and_media(entry):
             if url not in videos:
                 videos.append(url)
 
-    # Если текст всё ещё пустой — берём title как fallback
+    # Если текст пустой — fallback на title
     if not text:
+        title = getattr(entry, "title", "") or ""
         text = clean_html(title)
 
     return text, images, videos
@@ -156,11 +152,6 @@ async def fetch_tweets(username):
                 text, images, videos = extract_text_and_media(entry)
                 link = entry.link if hasattr(entry, "link") else ""
 
-                if images:
-                    logger.info(f"🖼 @{username}: {len(images)} фото — {images[0][:80]}...")
-                if videos:
-                    logger.info(f"🎬 @{username}: видео — {videos[0][:80]}...")
-
                 tweets.append({
                     "text": text,
                     "link": link,
@@ -170,7 +161,7 @@ async def fetch_tweets(username):
                     "username": username
                 })
 
-        logger.info(f"✅ @{username}: {len(tweets)} твитов, {sum(1 for t in tweets if t['images'])} с фото, {sum(1 for t in tweets if t['videos'])} с видео")
+        logger.info(f"✅ @{username}: {len(tweets)} твитов")
         return display_name, tweets
 
     except Exception as e:
@@ -193,7 +184,7 @@ async def mark_all_current_as_sent(username):
 
 def is_admin(user_id): return user_id == ADMIN_ID
 
-# --- АДМИН-КОМАНДЫ (без изменений) ---
+# --- АДМИН-КОМАНДЫ ---
 async def cmd_start(update, context):
     if not is_admin(update.effective_user.id): return
     await update.message.reply_text(
@@ -451,6 +442,7 @@ async def check_and_post(bot: Bot):
             save_sent_post(link)
             new_posts += 1
             await asyncio.sleep(3)
+        await asyncio.sleep(1)
 
     for username in bloggers:
         try:
@@ -467,6 +459,7 @@ async def check_and_post(bot: Bot):
             save_sent_post(link)
             new_posts += 1
             await asyncio.sleep(3)
+        await asyncio.sleep(1)
 
     if new_posts:
         logger.info(f"📤 Отправлено {new_posts} новых постов")
@@ -479,7 +472,7 @@ async def scheduled_check(bot: Bot):
             await check_and_post(bot)
         except Exception as e:
             logger.error(f"Цикл: {e}")
-        await asyncio.sleep(120)
+        await asyncio.sleep(90)
 
 async def main():
     global sent_posts_cache
