@@ -11,7 +11,7 @@ from telegram.error import TelegramError
 from telegram.ext import Application, CommandHandler
 
 # --- ЛОГИ ---
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # --- НАСТРОЙКИ ---
@@ -121,11 +121,15 @@ def extract_text_and_media(entry):
 # --- FETCH ---
 async def fetch_tweets(username):
     url = f"{RSSHUB_URL}/twitter/user/{username}"
+    logger.debug(f"🔍 @{username}: запрос к {url}")
+    
     for attempt in range(2):
         try:
             async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
                 headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/rss+xml, */*"}
                 response = await client.get(url, headers=headers)
+                
+                logger.debug(f"🔍 @{username}: статус {response.status_code}, размер ответа: {len(response.text)} байт")
                 
                 if response.status_code == 503:
                     wait = 3 if attempt == 0 else 5
@@ -134,14 +138,20 @@ async def fetch_tweets(username):
                     continue
                     
                 response.raise_for_status()
+                
+                # ✅ DEBUG: покажем, что пришло от RSSHub
+                if response.text.count('<item>') == 0:
+                    logger.warning(f"⚠️ @{username}: RSSHub вернул 200, но НЕТ <item>! Начало ответа: {response.text[:300]}")
+                
                 feed = feedparser.parse(response.text)
+                logger.debug(f"🔍 @{username}: feedparser нашёл {len(feed.entries)} записей")
                 
                 display_name = username
                 if hasattr(feed.feed, "title"):
                     display_name = feed.feed.title.replace("Twitter @", "").strip()
                     
                 tweets = []
-                for entry in feed.entries:
+                for i, entry in enumerate(feed.entries):
                     try:
                         text, images, videos = extract_text_and_media(entry)
                         link = getattr(entry, "link", "")
@@ -150,20 +160,23 @@ async def fetch_tweets(username):
                         match = re.search(r'/status/(\d+)', link)
                         tweet_id = match.group(1) if match else (link or f"{username}:{text[:30]}")
                         
+                        logger.debug(f"🔍 @{username} entry#{i}: tweet_id={tweet_id[:20]}..., text_len={len(text)}, images={len(images)}, videos={len(videos)}")
+                        
                         tweets.append({
                             "text": text, "link": link, "tweet_id": tweet_id,
                             "images": images, "videos": videos,
                             "display_name": display_name, "username": username
                         })
                     except Exception as e:
-                        logger.error(f"❌ @{username}: ошибка парсинга entry: {e}")
+                        logger.error(f"❌ @{username}: ошибка парсинга entry#{i}: {e}")
                         continue
                         
+                logger.info(f"✅ @{username}: распарсено {len(tweets)} твитов")
                 return display_name, tweets
                 
         except httpx.HTTPStatusError as e:
+            logger.error(f"❌ @{username}: HTTP {e.response.status_code}")
             if e.response.status_code != 503:
-                logger.error(f"❌ @{username}: HTTP {e.response.status_code}")
                 break
             await asyncio.sleep(3)
         except (httpx.ConnectTimeout, httpx.ReadTimeout):
@@ -221,12 +234,15 @@ async def send_post(bot: Bot, tweet, username):
         else:
             # ✅ Здесь параметр оставляем
             await bot.send_message(TELEGRAM_CHANNEL_ID, full_text, disable_web_page_preview=True)
+        return True
     except TelegramError as e:
-        logger.error(f"Ошибка отправки: {e}")
+        logger.error(f"❌ Ошибка отправки: {e}")
         try:
             await bot.send_message(TELEGRAM_CHANNEL_ID, full_text[:4096], disable_web_page_preview=True)
-        except:
-            pass
+            return True
+        except Exception as e2:
+            logger.error(f"❌ Фолбэк не сработал: {e2}")
+            return False
 
 # --- CORE ---
 async def check_and_post(bot: Bot, warmup: bool = False):
@@ -237,8 +253,12 @@ async def check_and_post(bot: Bot, warmup: bool = False):
     bloggers = load_bloggers()
     all_usernames = list(set(fans + bloggers))
     
-    if not all_usernames: return 0
-    if not sent_posts_cache: sent_posts_cache = load_sent_posts()
+    if not all_usernames: 
+        logger.info("⚠️ Нет аккаунтов для проверки")
+        return 0
+    if not sent_posts_cache: 
+        sent_posts_cache = load_sent_posts()
+        logger.info(f"📦 Загружено {len(sent_posts_cache)} ID из кэша")
     
     logger.info(f"🔄 Параллельная проверка {len(all_usernames)} каналов...")
     start_time = time.time()
@@ -251,7 +271,10 @@ async def check_and_post(bot: Bot, warmup: bool = False):
     
     for tweet in all_tweets:
         tweet_id = tweet.get("tweet_id") or tweet.get("link")
-        if not tweet_id or tweet_id in sent_posts_cache:
+        if not tweet_id:
+            logger.warning(f"⚠️ Пропущен твит без ID: {tweet.get('username')}")
+            continue
+        if tweet_id in sent_posts_cache:
             continue
             
         username = tweet["username"]
@@ -261,14 +284,16 @@ async def check_and_post(bot: Bot, warmup: bool = False):
         
         # ✅ В режиме прогрева только заполняем кэш, не шлём в ТГ
         if not warmup:
-            await send_post(bot, tweet, username)
-            new_posts += 1
-            await asyncio.sleep(0.5)
+            success = await send_post(bot, tweet, username)
+            if success:
+                logger.info(f"📨 @{username} | ID: {tweet_id[:20]}...")
+                new_posts += 1
+                await asyncio.sleep(0.5)
             
         save_sent_post(tweet_id)
         
     if new_posts:
-        logger.info(f"📤 Отправлено {new_posts} новых постов")
+        logger.info(f"✅ Отправлено {new_posts} новых постов")
     return new_posts
 
 async def scheduled_check(bot: Bot):
@@ -285,7 +310,7 @@ async def scheduled_check(bot: Bot):
         try:
             await check_and_post(bot, warmup=False)
         except Exception as e:
-            logger.error(f"❌ Цикл: {e}")
+            logger.error(f"❌ Цикл: {e}", exc_info=True)
         await asyncio.sleep(CHECK_INTERVAL)
 
 # --- КОМАНДЫ ---
@@ -308,6 +333,7 @@ async def cmd_addfan(update, context):
             count = await mark_all_current_as_sent(username)
             await update.message.reply_text(f"✅ {display_name} (@{username}) добавлен.\n📤 {count} постов пропущено.")
         except Exception as e:
+            logger.exception(f"❌ Ошибка в cmd_addfan: {e}")
             await update.message.reply_text(f"❌ Ошибка: {e}")
 
 async def cmd_addmanyfan(update, context):
@@ -330,7 +356,9 @@ async def cmd_addmanyfan(update, context):
                 save_fans(fans)
                 count = await mark_all_current_as_sent(username)
                 added.append(f"✅ {display_name} (@{username}) — {count} пропущено")
-            except: failed.append(f"❌ @{username}")
+            except Exception as e:
+                logger.exception(f"❌ Ошибка при добавлении @{username}: {e}")
+                failed.append(f"❌ @{username}")
             await asyncio.sleep(0.3)
         report = []
         if added: report.append(f"✨ Добавлены ({len(added)}):\n" + "\n".join(added))
@@ -371,6 +399,7 @@ async def cmd_addblogger(update, context):
             count = await mark_all_current_as_sent(username)
             await update.message.reply_text(f"✅ {display_name} (@{username}) добавлен.\n📤 {count} постов пропущено.")
         except Exception as e:
+            logger.exception(f"❌ Ошибка в cmd_addblogger: {e}")
             await update.message.reply_text(f"❌ Ошибка: {e}")
 
 async def cmd_addmanyblogger(update, context):
@@ -395,7 +424,9 @@ async def cmd_addmanyblogger(update, context):
                 save_bloggers(bloggers)
                 count = await mark_all_current_as_sent(username)
                 added.append(f"✅ {display_name} (@{username}) — {count} пропущено")
-            except: failed.append(f"❌ @{username}")
+            except Exception as e:
+                logger.exception(f"❌ Ошибка при добавлении блогера @{username}: {e}")
+                failed.append(f"❌ @{username}")
             await asyncio.sleep(0.3)
         report = []
         if added: report.append(f"✨ Добавлены ({len(added)}):\n" + "\n".join(added))
