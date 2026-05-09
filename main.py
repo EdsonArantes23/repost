@@ -27,6 +27,8 @@ FANS_FILE = "chelsea_fans.txt"
 BLOGGERS_FILE = "general_bloggers.txt"
 KEYWORDS_FILE = "keywords.txt"
 
+# Глобальный кеш отправленных — чтобы не читать файл каждый раз
+sent_posts_cache = set()
 adding_lock = asyncio.Lock()
 
 # --- ЗАГРУЗКА/СОХРАНЕНИЕ ---
@@ -62,13 +64,17 @@ def save_keywords(keywords):
     save_list(KEYWORDS_FILE, keywords)
 
 def load_sent_posts():
+    global sent_posts_cache
     try:
         with open(SENT_POSTS_FILE, "r") as f:
-            return set(line.strip() for line in f)
+            sent_posts_cache = set(line.strip() for line in f)
     except FileNotFoundError:
-        return set()
+        sent_posts_cache = set()
+    return sent_posts_cache
 
 def save_sent_post(post_id):
+    global sent_posts_cache
+    sent_posts_cache.add(post_id)
     with open(SENT_POSTS_FILE, "a") as f:
         f.write(post_id + "\n")
 
@@ -88,49 +94,39 @@ def extract_media(entry):
     images = []
     videos = []
 
-    # Способ 1: media_content (стандарт RSS)
+    # Способ 1: media_content
     if hasattr(entry, "media_content") and entry.media_content:
         for media in entry.media_content:
             url = media.get("url", "")
-            media_type = media.get("type", "")
-            if url:
-                if "image" in media_type or url.endswith((".jpg", ".jpeg", ".png", ".webp")):
-                    if url not in images:
-                        images.append(url)
-                elif "video" in media_type or url.endswith((".mp4", ".mov")):
-                    if url not in videos:
-                        videos.append(url)
-
-    # Способ 2: description (HTML с img/video тегами)
-    description = ""
-    if hasattr(entry, "description"):
-        description = entry.description
-    elif hasattr(entry, "summary"):
-        description = entry.summary
-
-    if description:
-        # Картинки из img тегов
-        img_urls = re.findall(r'<img[^>]+src="([^"]+)"', description)
-        for url in img_urls:
-            if url not in images and "pbs.twimg.com" in url:
+            if url and url not in images:
                 images.append(url)
 
-        # Видео из video тегов
+    # Способ 2: description/summary
+    description = getattr(entry, "description", "") or getattr(entry, "summary", "")
+    if description:
+        # Картинки
+        img_urls = re.findall(r'<img[^>]+src="([^"]+)"', description)
+        for url in img_urls:
+            if url not in images:
+                images.append(url)
+        # Видео
         video_urls = re.findall(r'<video[^>]+src="([^"]+)"', description)
         for url in video_urls:
             if url not in videos:
                 videos.append(url)
 
-    # Способ 3: links в feedparser
+    # Способ 3: links
     if hasattr(entry, "links"):
         for link in entry.links:
             href = link.get("href", "")
             link_type = link.get("type", "")
-            if href and href not in images and href not in videos:
-                if "image" in link_type or href.endswith((".jpg", ".jpeg", ".png", ".webp")):
-                    images.append(href)
-                elif "video" in link_type or href.endswith((".mp4", ".mov")):
-                    videos.append(href)
+            if href:
+                if "image" in link_type:
+                    if href not in images:
+                        images.append(href)
+                elif "video" in link_type:
+                    if href not in videos:
+                        videos.append(href)
 
     return images, videos
 
@@ -155,9 +151,10 @@ async def fetch_tweets(username):
             for entry in feed.entries:
                 text = entry.title if hasattr(entry, "title") else ""
                 link = entry.link if hasattr(entry, "link") else ""
-
-                # Медиа (передаём весь entry для поиска разными способами)
                 images, videos = extract_media(entry)
+
+                if images:
+                    logger.info(f"🖼 @{username}: найдено {len(images)} фото для «{text[:50]}...»")
 
                 tweets.append({
                     "text": text,
@@ -168,7 +165,7 @@ async def fetch_tweets(username):
                     "username": username
                 })
 
-        logger.info(f"✅ @{username}: {len(tweets)} твитов, {sum(1 for t in tweets if t['images'])} с фото")
+        logger.info(f"✅ @{username}: {len(tweets)} твитов")
         return display_name, tweets
 
     except Exception as e:
@@ -412,7 +409,7 @@ async def cmd_status(update, context):
     fans = load_fans()
     bloggers = load_bloggers()
     keywords = load_keywords()
-    sent = len(load_sent_posts())
+    sent = len(sent_posts_cache)
     await update.message.reply_text(
         f"✅ Бот активен\n📡 @chelsea_news_insider\n🔵 Фан-каналов: {len(fans)}\n🟡 Блогеров: {len(bloggers)}\n🔑 Слов: {len(keywords)}\n📤 Постов: {sent}"
     )
@@ -464,21 +461,24 @@ async def send_post(bot: Bot, tweet, username):
     except TelegramError as e:
         logger.error(f"Ошибка отправки: {e}")
         try:
-            await bot.send_message(
-                TELEGRAM_CHANNEL_ID,
-                full_text,
-                disable_web_page_preview=True
-            )
+            await bot.send_message(TELEGRAM_CHANNEL_ID, full_text, disable_web_page_preview=True)
         except:
             pass
 
 async def check_and_post(bot: Bot):
+    global sent_posts_cache
+
     async with adding_lock:
         pass
+
     fans = load_fans()
     bloggers = load_bloggers()
     keywords = load_keywords()
-    sent_posts = load_sent_posts()
+
+    # Обновляем кеш отправленных
+    if not sent_posts_cache:
+        sent_posts_cache = load_sent_posts()
+
     new_posts = 0
 
     for username in fans:
@@ -487,13 +487,13 @@ async def check_and_post(bot: Bot):
         except:
             continue
         for tweet in tweets:
-            if tweet["link"] in sent_posts:
+            link = tweet["link"]
+            if link in sent_posts_cache:
                 continue
             await send_post(bot, tweet, username)
-            save_sent_post(tweet["link"])
-            sent_posts.add(tweet["link"])
+            save_sent_post(link)  # Сохраняет и в файл, и в кеш
             new_posts += 1
-            await asyncio.sleep(2)
+            await asyncio.sleep(3)
 
     for username in bloggers:
         try:
@@ -501,15 +501,18 @@ async def check_and_post(bot: Bot):
         except:
             continue
         for tweet in tweets:
-            if tweet["link"] in sent_posts:
+            link = tweet["link"]
+            if link in sent_posts_cache:
                 continue
             if not post_matches_filter(tweet["text"], keywords):
                 continue
             await send_post(bot, tweet, username)
-            save_sent_post(tweet["link"])
-            sent_posts.add(tweet["link"])
+            save_sent_post(link)
             new_posts += 1
-            await asyncio.sleep(2)
+            await asyncio.sleep(3)
+
+    if new_posts:
+        logger.info(f"📤 Отправлено {new_posts} новых постов")
 
     return new_posts
 
@@ -523,9 +526,13 @@ async def scheduled_check(bot: Bot):
         await asyncio.sleep(120)
 
 async def main():
+    global sent_posts_cache
     if not TELEGRAM_BOT_TOKEN:
         logger.critical("❌ Нет BOT_TOKEN!")
         return
+
+    sent_posts_cache = load_sent_posts()
+
     bot = Bot(token=TELEGRAM_BOT_TOKEN)
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
