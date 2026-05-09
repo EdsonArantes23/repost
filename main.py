@@ -123,40 +123,74 @@ def extract_text_and_media(entry):
     return text, images, videos
 
 async def fetch_tweets(username):
+    """Получает твиты с повторными попытками при ошибках."""
     url = f"{RSSHUB_URL}/twitter/user/{username}"
-    tweets = []
-    display_name = username
 
-    try:
-        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-            headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/rss+xml, */*"}
-            response = await client.get(url, headers=headers)
-            response.raise_for_status()
+    for attempt in range(3):
+        try:
+            async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+                headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/rss+xml, */*"}
+                response = await client.get(url, headers=headers)
 
-            feed = feedparser.parse(response.text)
+                if response.status_code == 503:
+                    wait = 5 if attempt == 0 else 10
+                    logger.warning(f"⚠️ @{username}: 503, попытка {attempt+1}/3, жду {wait} сек...")
+                    await asyncio.sleep(wait)
+                    continue
 
-            if hasattr(feed.feed, "title"):
-                display_name = feed.feed.title.replace("Twitter @", "").strip()
+                response.raise_for_status()
+                feed = feedparser.parse(response.text)
 
-            for entry in feed.entries:
-                text, images, videos = extract_text_and_media(entry)
-                link = entry.link if hasattr(entry, "link") else ""
+                display_name = username
+                if hasattr(feed.feed, "title"):
+                    display_name = feed.feed.title.replace("Twitter @", "").strip()
 
-                tweets.append({
-                    "text": text,
-                    "link": link,
-                    "images": images,
-                    "videos": videos,
-                    "display_name": display_name,
-                    "username": username
-                })
+                tweets = []
+                for entry in feed.entries:
+                    text, images, videos = extract_text_and_media(entry)
+                    link = entry.link if hasattr(entry, "link") else ""
+                    tweets.append({
+                        "text": text, "link": link,
+                        "images": images, "videos": videos,
+                        "display_name": display_name, "username": username
+                    })
 
-        logger.info(f"✅ @{username}: {len(tweets)} твитов")
-        return display_name, tweets
+                return display_name, tweets
 
-    except Exception as e:
-        logger.error(f"❌ @{username}: {type(e).__name__}: {e}")
-        return username, []
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 503:
+                wait = 5 if attempt == 0 else 10
+                logger.warning(f"⚠️ @{username}: 503, попытка {attempt+1}/3, жду {wait} сек...")
+                await asyncio.sleep(wait)
+            else:
+                logger.error(f"❌ @{username}: HTTP {e.response.status_code}")
+                break
+        except (httpx.ConnectTimeout, httpx.ReadTimeout):
+            logger.warning(f"⚠️ @{username}: таймаут, попытка {attempt+1}/3")
+            await asyncio.sleep(3)
+        except Exception as e:
+            logger.error(f"❌ @{username}: {type(e).__name__}: {e}")
+            break
+
+    logger.error(f"❌ @{username}: не удалось после 3 попыток")
+    return username, []
+
+async def fetch_all_tweets(usernames):
+    """Параллельно получает твиты для всех каналов."""
+    tasks = [fetch_tweets(username) for username in usernames]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    all_tweets = []
+    for result in results:
+        if isinstance(result, Exception):
+            logger.error(f"❌ Ошибка при параллельной проверке: {result}")
+            continue
+        display_name, tweets = result
+        if tweets:
+            all_tweets.extend(tweets)
+            logger.info(f"📦 {display_name}: {len(tweets)} твитов")
+
+    return all_tweets
 
 async def mark_all_current_as_sent(username):
     _, tweets = await fetch_tweets(username)
@@ -412,44 +446,43 @@ async def check_and_post(bot: Bot):
     global sent_posts_cache
     async with adding_lock:
         pass
+
     fans = load_fans()
     bloggers = load_bloggers()
-    keywords = load_keywords()
+    all_usernames = list(set(fans + bloggers))  # Убираем дубли, если канал в обоих списках
+
+    if not all_usernames:
+        return 0
+
     if not sent_posts_cache:
         sent_posts_cache = load_sent_posts()
+
+    # Параллельная проверка всех каналов
+    logger.info(f"🔄 Параллельная проверка {len(all_usernames)} каналов...")
+    start_time = time.time()
+    all_tweets = await fetch_all_tweets(all_usernames)
+    elapsed = time.time() - start_time
+    logger.info(f"⏱ Проверка заняла {elapsed:.1f} сек, получено {len(all_tweets)} твитов")
+
+    # Отправка новых постов
+    keywords = load_keywords()
     new_posts = 0
 
-    for username in fans:
-        try:
-            _, tweets = await fetch_tweets(username)
-        except:
+    for tweet in all_tweets:
+        link = tweet["link"]
+        if link in sent_posts_cache:
             continue
-        for tweet in tweets:
-            link = tweet["link"]
-            if link in sent_posts_cache:
-                continue
-            await send_post(bot, tweet, username)
-            save_sent_post(link)
-            new_posts += 1
-            await asyncio.sleep(2)
-        await asyncio.sleep(0.5)
 
-    for username in bloggers:
-        try:
-            _, tweets = await fetch_tweets(username)
-        except:
-            continue
-        for tweet in tweets:
-            link = tweet["link"]
-            if link in sent_posts_cache:
-                continue
+        # Фильтр для блогеров
+        username = tweet["username"]
+        if username in bloggers and username not in fans:
             if not post_matches_filter(tweet["text"], keywords):
                 continue
-            await send_post(bot, tweet, username)
-            save_sent_post(link)
-            new_posts += 1
-            await asyncio.sleep(2)
-        await asyncio.sleep(0.5)
+
+        await send_post(bot, tweet, username)
+        save_sent_post(link)
+        new_posts += 1
+        await asyncio.sleep(2)
 
     if new_posts:
         logger.info(f"📤 Отправлено {new_posts} новых постов")
@@ -462,7 +495,7 @@ async def scheduled_check(bot: Bot):
             await check_and_post(bot)
         except Exception as e:
             logger.error(f"Цикл: {e}")
-        await asyncio.sleep(60)
+        await asyncio.sleep(45)
 
 async def main():
     global sent_posts_cache
@@ -488,7 +521,7 @@ async def main():
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("force", cmd_force))
     asyncio.create_task(scheduled_check(bot))
-    logger.info("🤖 Бот запущен через RSSHub")
+    logger.info("🤖 Бот запущен через RSSHub (параллельный режим)")
     await app.run_polling()
 
 if __name__ == "__main__":
