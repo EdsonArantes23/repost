@@ -7,9 +7,9 @@ import httpx
 import hashlib
 import nest_asyncio
 import feedparser
-from telegram import Bot, InputMediaPhoto
+from telegram import Bot, InputMediaPhoto, Update
 from telegram.error import TelegramError
-from telegram.ext import Application, CommandHandler, ContextTypes, Update
+from telegram.ext import Application, CommandHandler, ContextTypes
 
 # --- ЛОГИ ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 TELEGRAM_BOT_TOKEN = os.getenv("BOT_TOKEN")
 TELEGRAM_CHANNEL_ID = -1003857194781
 ADMIN_ID = 417850992
-# ✅ Добавлен cacheTime=60, чтобы RSSHub не кэшировал твиты дольше минуты
+# ✅ cacheTime=60 сокращает кэш RSSHub с 5-15 мин до 1 минуты
 RSSHUB_URL = "https://chelsea-rss-bridge.onrender.com?cacheTime=60"
 SENT_POSTS_FILE = "sent_posts.txt"
 FANS_FILE = "chelsea_fans.txt"
@@ -59,7 +59,7 @@ def load_sent_posts():
         sent_posts_cache = set()
     return sent_posts_cache
 
-# ✅ Исправлено: не сохраняет пустые ключи и проверяет наличие
+# ✅ Не сохраняет пустые ключи и проверяет дубликаты
 def save_sent_post(post_id):
     global sent_posts_cache
     if not post_id or post_id in sent_posts_cache:
@@ -115,15 +115,15 @@ def extract_text_and_media(entry):
 
 async def fetch_tweets(username):
     url = f"{RSSHUB_URL}/twitter/user/{username}"
-    for attempt in range(3):
+    for attempt in range(2):
         try:
-            async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
-                headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+            async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+                headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/rss+xml, */*"}
                 response = await client.get(url, headers=headers)
                 
                 if response.status_code == 503:
-                    wait = 2 ** attempt
-                    logger.warning(f"⚠️ @{username}: 503, попытка {attempt+1}/3, жду {wait} сек...")
+                    wait = 3 if attempt == 0 else 5
+                    logger.warning(f"⚠️ @{username}: 503, попытка {attempt+1}/2, жду {wait} сек...")
                     await asyncio.sleep(wait)
                     continue
                     
@@ -135,8 +135,7 @@ async def fetch_tweets(username):
                 for entry in feed.entries:
                     try:
                         text, images, videos = extract_text_and_media(entry)
-                        
-                        # ✅ Надёжный ключ: id > link > hash от контента
+                        # ✅ Надёжный ключ: id > link > MD5 хэш
                         post_id = getattr(entry, 'id', None) or getattr(entry, 'link', None)
                         if not post_id:
                             post_id = hashlib.md5(f"{text}{getattr(entry, 'published', '')}".encode()).hexdigest()
@@ -151,21 +150,21 @@ async def fetch_tweets(username):
                         logger.error(f"❌ @{username}: ошибка парсинга entry: {e}")
                         continue
                         
-                logger.info(f"✅ @{username}: получено {len(tweets)} твитов")
                 return display_name, tweets
                 
         except httpx.HTTPStatusError as e:
-            logger.error(f"❌ @{username}: HTTP {e.response.status_code}")
-            if e.response.status_code == 404: break
-            await asyncio.sleep(2 ** attempt)
+            if e.response.status_code == 503:
+                await asyncio.sleep(3)
+            else:
+                logger.error(f"❌ @{username}: HTTP {e.response.status_code}")
+                break
         except (httpx.ConnectTimeout, httpx.ReadTimeout):
-            logger.warning(f"⚠️ @{username}: таймаут, попытка {attempt+1}/3")
+            logger.warning(f"⚠️ @{username}: таймаут, попытка {attempt+1}/2")
             await asyncio.sleep(2)
         except Exception as e:
             logger.error(f"❌ @{username}: {type(e).__name__}: {e}")
-            await asyncio.sleep(1)
+            break
             
-    logger.error(f"❌ @{username}: не удалось после 3 попыток")
     return username, []
 
 async def fetch_all_tweets(usernames):
@@ -178,25 +177,24 @@ async def fetch_all_tweets(usernames):
         if isinstance(res, Exception):
             logger.error(f"❌ Ошибка {usernames[i] if i < len(usernames) else '?'}: {res}")
             continue
-        if not isinstance(res, tuple) or len(res) != 2:
-            continue
-        display_name, tweets = res
-        if tweets:
-            all_tweets.extend(tweets)
+        if isinstance(res, tuple) and len(res) == 2:
+            _, tweets = res
+            if tweets:
+                all_tweets.extend(tweets)
     return all_tweets
 
 async def mark_all_current_as_sent(username):
     _, tweets = await fetch_tweets(username)
     count = 0
     for t in tweets:
-        save_sent_post(t["post_id"])  # ✅ Теперь использует надёжный post_id
+        save_sent_post(t["post_id"])
         count += 1
     logger.info(f"📝 @{username}: пропущено {count} старых постов")
     return count
 
 def is_admin(user_id): return user_id == ADMIN_ID
 
-# --- АДМИН-КОМАНДЫ (оставлены без изменений, логика идентична вашей) ---
+# --- АДМИН-КОМАНДЫ ---
 async def cmd_start(update, context):
     if not is_admin(update.effective_user.id): return
     await update.message.reply_text("👋 Бот готов. Команды: /status, /force, /addfan, /addblogger и т.д.")
@@ -375,19 +373,15 @@ async def cmd_listwords(update, context):
 
 async def cmd_status(update, context):
     if not is_admin(update.effective_user.id): return
-    fans = load_fans()
-    bloggers = load_bloggers()
-    keywords = load_keywords()
-    sent = len(sent_posts_cache)
     await update.message.reply_text(
-        f"✅ Бот активен\n📡 @chelsea_news_insider\n🔵 Фан-каналов: {len(fans)}\n🟡 Блогеров: {len(bloggers)}\n🔑 Слов: {len(keywords)}\n📤 Постов: {sent}"
+        f"✅ Бот активен\n📡 @chelsea_news_insider\n🔵 Фан-каналов: {len(load_fans())}\n🟡 Блогеров: {len(load_bloggers())}\n📤 Отправлено: {len(sent_posts_cache)}"
     )
 
 async def cmd_force(update, context):
     if not is_admin(update.effective_user.id): return
     await update.message.reply_text("🔄 Проверка...")
-    count = await check_and_post(context.bot)
-    await update.message.reply_text(f"✅ Отправлено: {count} постов.")
+    cnt = await check_and_post(context.bot)
+    await update.message.reply_text(f"✅ Отправлено: {cnt}")
 
 # --- ОСНОВНАЯ ЛОГИКА ---
 async def send_post(bot: Bot, tweet, username):
@@ -439,7 +433,7 @@ async def check_and_post(bot: Bot):
         await send_post(bot, t, t["username"])
         save_sent_post(t["post_id"])
         new_cnt += 1
-        await asyncio.sleep(1)  # ✅ Уменьшено до 1 сек для скорости
+        await asyncio.sleep(1)  # ✅ Уменьшено до 1 сек
         
     return new_cnt
 
@@ -450,7 +444,7 @@ async def scheduled_check(bot: Bot):
             await check_and_post(bot)
         except Exception as e:
             logger.exception(f"❌ Ошибка в цикле: {e}")
-        await asyncio.sleep(15)  # ✅ Опрос каждые 15 сек (было 30)
+        await asyncio.sleep(15)  # ✅ Опрос каждые 15 сек
 
 async def main():
     global sent_posts_cache
@@ -477,7 +471,7 @@ async def main():
     app.add_handler(CommandHandler("force", cmd_force))
     
     asyncio.create_task(scheduled_check(app.bot))
-    logger.info("🤖 Бот запущен (улучшенная версия)")
+    logger.info("🤖 Бот запущен (исправленная версия)")
     await app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
@@ -485,4 +479,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("🛑 Остановлен")
+        logger.info("🛑 Остановлен пользователем")
