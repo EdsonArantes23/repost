@@ -7,7 +7,7 @@ import time
 import httpx
 import nest_asyncio
 import feedparser
-from telegram import Bot, InputMediaPhoto, InputMediaVideo
+from telegram import Bot, InputMediaPhoto
 from telegram.error import TelegramError
 from telegram.ext import Application, CommandHandler, ContextTypes
 
@@ -83,22 +83,54 @@ def post_matches_filter(text, keywords):
     return False
 
 # --- ИЗВЛЕЧЕНИЕ МЕДИА ---
-def extract_media(description):
-    """Извлекает картинки и видео из description RSS."""
+def extract_media(entry):
+    """Извлекает картинки и видео из RSS-записи."""
     images = []
     videos = []
 
-    # Картинки
-    img_urls = re.findall(r'<img[^>]+src="([^"]+)"', description)
-    for url in img_urls:
-        if url not in images:
-            images.append(url)
+    # Способ 1: media_content (стандарт RSS)
+    if hasattr(entry, "media_content") and entry.media_content:
+        for media in entry.media_content:
+            url = media.get("url", "")
+            media_type = media.get("type", "")
+            if url:
+                if "image" in media_type or url.endswith((".jpg", ".jpeg", ".png", ".webp")):
+                    if url not in images:
+                        images.append(url)
+                elif "video" in media_type or url.endswith((".mp4", ".mov")):
+                    if url not in videos:
+                        videos.append(url)
 
-    # Видео
-    video_urls = re.findall(r'<video[^>]+src="([^"]+)"', description)
-    for url in video_urls:
-        if url not in videos:
-            videos.append(url)
+    # Способ 2: description (HTML с img/video тегами)
+    description = ""
+    if hasattr(entry, "description"):
+        description = entry.description
+    elif hasattr(entry, "summary"):
+        description = entry.summary
+
+    if description:
+        # Картинки из img тегов
+        img_urls = re.findall(r'<img[^>]+src="([^"]+)"', description)
+        for url in img_urls:
+            if url not in images and "pbs.twimg.com" in url:
+                images.append(url)
+
+        # Видео из video тегов
+        video_urls = re.findall(r'<video[^>]+src="([^"]+)"', description)
+        for url in video_urls:
+            if url not in videos:
+                videos.append(url)
+
+    # Способ 3: links в feedparser
+    if hasattr(entry, "links"):
+        for link in entry.links:
+            href = link.get("href", "")
+            link_type = link.get("type", "")
+            if href and href not in images and href not in videos:
+                if "image" in link_type or href.endswith((".jpg", ".jpeg", ".png", ".webp")):
+                    images.append(href)
+                elif "video" in link_type or href.endswith((".mp4", ".mov")):
+                    videos.append(href)
 
     return images, videos
 
@@ -124,9 +156,8 @@ async def fetch_tweets(username):
                 text = entry.title if hasattr(entry, "title") else ""
                 link = entry.link if hasattr(entry, "link") else ""
 
-                # Медиа
-                description = entry.description if hasattr(entry, "description") else entry.summary if hasattr(entry, "summary") else ""
-                images, videos = extract_media(description)
+                # Медиа (передаём весь entry для поиска разными способами)
+                images, videos = extract_media(entry)
 
                 tweets.append({
                     "text": text,
@@ -137,7 +168,7 @@ async def fetch_tweets(username):
                     "username": username
                 })
 
-        logger.info(f"✅ @{username}: {len(tweets)} твитов")
+        logger.info(f"✅ @{username}: {len(tweets)} твитов, {sum(1 for t in tweets if t['images'])} с фото")
         return display_name, tweets
 
     except Exception as e:
@@ -402,16 +433,20 @@ async def send_post(bot: Bot, tweet, username):
 
     try:
         if videos:
-            # Отправляем видео
             await bot.send_video(
                 TELEGRAM_CHANNEL_ID,
                 video=videos[0],
                 caption=full_text[:1024],
-                supports_streaming=True
+                supports_streaming=True,
+                disable_web_page_preview=True
             )
         elif images:
             if len(images) == 1:
-                await bot.send_photo(TELEGRAM_CHANNEL_ID, images[0], caption=full_text[:1024])
+                await bot.send_photo(
+                    TELEGRAM_CHANNEL_ID,
+                    images[0],
+                    caption=full_text[:1024]
+                )
             else:
                 media = []
                 for i, img in enumerate(images[:10]):
@@ -421,11 +456,19 @@ async def send_post(bot: Bot, tweet, username):
                         media.append(InputMediaPhoto(media=img))
                 await bot.send_media_group(TELEGRAM_CHANNEL_ID, media)
         else:
-            await bot.send_message(TELEGRAM_CHANNEL_ID, full_text)
+            await bot.send_message(
+                TELEGRAM_CHANNEL_ID,
+                full_text,
+                disable_web_page_preview=True
+            )
     except TelegramError as e:
         logger.error(f"Ошибка отправки: {e}")
         try:
-            await bot.send_message(TELEGRAM_CHANNEL_ID, full_text)
+            await bot.send_message(
+                TELEGRAM_CHANNEL_ID,
+                full_text,
+                disable_web_page_preview=True
+            )
         except:
             pass
 
