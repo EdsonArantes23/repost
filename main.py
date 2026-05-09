@@ -25,7 +25,7 @@ FANS_FILE = "chelsea_fans.txt"
 BLOGGERS_FILE = "general_bloggers.txt"
 KEYWORDS_FILE = "keywords.txt"
 
-# ✅ ПРИ ПЕРВОМ ЗАПУСКЕ: TRUE -> бот только заполнит кэш, старые посты НЕ отправит
+# ✅ ПРИ ПЕРВОМ ЗАПУСКЕ: не отправлять старые посты
 WARMUP_MODE = True
 
 sent_posts_cache = set()
@@ -135,6 +135,10 @@ async def fetch_tweets(username):
                     
                 response.raise_for_status()
                 feed = feedparser.parse(response.text)
+                
+                # ✅ DEBUG: покажем, что пришло от RSSHub
+                logger.debug(f"@{username}: feed.entries = {len(feed.entries)} шт.")
+                
                 display_name = username
                 if hasattr(feed.feed, "title"):
                     display_name = feed.feed.title.replace("Twitter @", "").strip()
@@ -145,7 +149,7 @@ async def fetch_tweets(username):
                         text, images, videos = extract_text_and_media(entry)
                         link = getattr(entry, "link", "")
                         
-                        # ✅ Надёжный ключ: извлекаем ID твита или делаем fallback
+                        # ✅ FIX: надёжный ключ — извлекаем ID твита или делаем fallback
                         match = re.search(r'/status/(\d+)', link)
                         tweet_id = match.group(1) if match else (link or f"{username}:{text[:30]}")
                         
@@ -190,14 +194,6 @@ async def fetch_all_tweets(usernames):
         if tweets:
             all_tweets.extend(tweets)
     return all_tweets
-
-async def mark_all_current_as_sent(username):
-    _, tweets = await fetch_tweets(username)
-    count = 0
-    for t in tweets:
-        save_sent_post(t.get("tweet_id") or t.get("link"))
-        count += 1
-    return count
 
 # --- TELEGRAM SEND ---
 async def send_post(bot: Bot, tweet, username):
@@ -487,6 +483,14 @@ async def cmd_force(update, context):
     await update.message.reply_text("🔄 Проверка...")
     count = await check_and_post(context.bot, warmup=False)
     await update.message.reply_text(f"✅ Отправлено: {count} постов.")
+
+async def mark_all_current_as_sent(username):
+    _, tweets = await fetch_tweets(username)
+    count = 0
+    for t in tweets:
+        save_sent_post(t.get("tweet_id") or t.get("link"))
+        count += 1
+    return count
 
 # --- MAIN ---
 async def main():
