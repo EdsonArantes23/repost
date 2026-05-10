@@ -67,10 +67,15 @@ def save_sent_post(post_id):
         f.write(post_id + "\n")
 
 def post_matches_filter(text, keywords):
+    """
+    Проверяет, содержит ли текст ключевые слова.
+    Ищет ТОЧНОЕ совпадение фразы целиком (не разбивает на отдельные слова).
+    """
     if not keywords:
         return True
     text_lower = text.lower()
     for kw in keywords:
+        # Ищем точное совпадение фразы
         if kw.lower() in text_lower:
             return True
     return False
@@ -84,25 +89,21 @@ def clean_html(text):
     return text
 
 def extract_images(entry):
-    """Извлекает ТОЛЬКО картинки из RSS-записи."""
     images = []
     raw_desc = getattr(entry, "description", "") or getattr(entry, "summary", "")
 
-    # Способ 1: img теги в сыром HTML
     img_urls = re.findall(r'<img[^>]+src="([^"]+)"', raw_desc)
     for url in img_urls:
         url = url.replace("&amp;", "&")
         if url not in images and "pbs.twimg.com" in url:
             images.append(url)
 
-    # Способ 2: media_content (стандарт RSS)
     if not images and hasattr(entry, "media_content") and entry.media_content:
         for media in entry.media_content:
             url = media.get("url", "").replace("&amp;", "&")
             if url and url not in images:
                 images.append(url)
 
-    # Способ 3: прямые ссылки на pbs.twimg.com в тексте
     if not images:
         direct_urls = re.findall(r'https?://pbs\.twimg\.com/media/[^\s"\'&]+', raw_desc)
         for url in direct_urls:
@@ -110,7 +111,6 @@ def extract_images(entry):
             if url not in images:
                 images.append(url)
 
-    # Способ 4: enclosure (ещё один стандарт RSS)
     if not images and hasattr(entry, "enclosures") and entry.enclosures:
         for enc in entry.enclosures:
             url = enc.get("href", "").replace("&amp;", "&")
@@ -120,29 +120,35 @@ def extract_images(entry):
     return images
 
 def extract_text(entry):
-    """Извлекает текст и внешние ссылки из RSS-записи."""
     description = getattr(entry, "description", "") or getattr(entry, "summary", "")
 
     if description:
-        clean_desc = re.split(r'<hr[^>]*>|<div class="rsshub-quote">', description)[0]
-        text_with_breaks = re.sub(r'<br\s*/?>', '\n', clean_desc)
-        text = clean_html(text_with_breaks)
+        parts = re.split(r'<hr[^>]*>|<div class="rsshub-quote">', description)
+        main_text = parts[0]
+        quote_text = ""
+        if len(parts) > 1:
+            quote_raw = parts[1]
+            quote_text = clean_html(quote_raw)
+            if quote_text:
+                quote_text = f"\n\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n{quote_text}\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄"
 
-        if text:
-            # Ищем внешние ссылки (не twitter, не медиа)
+        text_with_breaks = re.sub(r'<br\s*/?>', '\n', main_text)
+        text = clean_html(text_with_breaks)
+        text = text + quote_text
+
+        if text.strip():
             external_urls = re.findall(r'https?://[^\s"\'<&]+', description)
             for url in external_urls:
                 if any(d in url for d in ['x.com', 'twitter.com', 'pbs.twimg.com', 'video.twimg.com']):
                     continue
                 if url not in text:
                     text = text + "\n" + url
-            return text
+            return text.strip()
 
     title = getattr(entry, "title", "") or ""
     return clean_html(title)
 
 def extract_videos(entry):
-    """Извлекает ТОЛЬКО видео из RSS-записи."""
     videos = []
     raw_desc = getattr(entry, "description", "") or getattr(entry, "summary", "")
 
@@ -252,8 +258,8 @@ async def cmd_start(update, context):
     await update.message.reply_text(
         "👋 Привет, админ!\n\n"
         "📋 Фан-каналы:\n/addfan, /addmanyfan, /removefan, /listfan\n\n"
-        "📋 Блогеры:\n/addblogger, /addmanyblogger, /removeblogger, /listbloggers\n\n"
-        "🔑 Ключевые слова:\n/addword, /addwords, /removeword, /listwords\n\n"
+        "📋 Блогеры:\n/addblogger, /addmanyblogger, /removeblogger, /removemanyblogger, /listbloggers\n\n"
+        "🔑 Ключевые слова:\n/addword, /addwords, /removeword, /removemanywords, /listwords\n\n"
         "📊 /status, /force"
     )
 
@@ -325,7 +331,7 @@ async def cmd_addblogger(update, context):
     bloggers = load_bloggers()
     if username in bloggers: await update.message.reply_text(f"⚠️ @{username} уже в блогерах."); return
     keywords = load_keywords()
-    kw_msg = f"🔑 Слова: {', '.join(keywords)}" if keywords else "⚠️ Слов нет — репостится всё!"
+    kw_msg = f"🔑 Слов: {len(keywords)}" if keywords else "⚠️ Слов нет — репостится всё!"
     async with adding_lock:
         await update.message.reply_text(f"⏳ Добавляю @{username}...\n{kw_msg}")
         try:
@@ -348,7 +354,7 @@ async def cmd_addmanyblogger(update, context):
     async with adding_lock:
         bloggers = load_bloggers()
         keywords = load_keywords()
-        kw_msg = f"🔑 Слова: {', '.join(keywords)}" if keywords else "⚠️ Слов нет — репостится всё!"
+        kw_msg = f"🔑 Слов: {len(keywords)}" if keywords else "⚠️ Слов нет — репостится всё!"
         added, skipped, failed = [], [], []
         await update.message.reply_text(f"⏳ Обрабатываю {len(usernames)} блогеров...\n{kw_msg}")
         for username in usernames:
@@ -377,36 +383,66 @@ async def cmd_removeblogger(update, context):
     save_bloggers(bloggers)
     await update.message.reply_text(f"✅ @{username} удалён.")
 
+async def cmd_removemanyblogger(update, context):
+    if not is_admin(update.effective_user.id): return
+    if not context.args: await update.message.reply_text("❌ /removemanyblogger @user1 @user2 ..."); return
+    raw_input = " ".join(context.args)
+    mentions = re.findall(r'@(\w+)', raw_input)
+    links = re.findall(r'https?://(?:x\.com|twitter\.com)/(\w+)', raw_input)
+    usernames = list(dict.fromkeys(mentions + links))
+    if not usernames: await update.message.reply_text("❌ Не удалось распознать username."); return
+
+    bloggers = load_bloggers()
+    removed, not_found = [], []
+    for username in usernames:
+        if username in bloggers:
+            bloggers.remove(username)
+            removed.append(f"• @{username}")
+        else:
+            not_found.append(f"• @{username}")
+
+    save_bloggers(bloggers)
+    report = []
+    if removed: report.append(f"✅ Удалены ({len(removed)}):\n" + "\n".join(removed))
+    if not_found: report.append(f"⚠️ Не найдены ({len(not_found)}):\n" + "\n".join(not_found))
+    await update.message.reply_text("\n\n".join(report) if report else "Ничего не изменилось.")
+
 async def cmd_listbloggers(update, context):
     if not is_admin(update.effective_user.id): return
     bloggers = load_bloggers()
     keywords = load_keywords()
-    kw_msg = f"🔑 Слова: {', '.join(keywords)}" if keywords else "⚠️ Слов нет"
+    kw_msg = f"🔑 Слов: {len(keywords)}" if keywords else "⚠️ Слов нет"
     if not bloggers: await update.message.reply_text(f"📋 Блогеры: пусто.\n{kw_msg}"); return
     await update.message.reply_text(f"📋 Блогеры:\n" + "\n".join([f"• @{b}" for b in bloggers]) + f"\n\n{kw_msg}")
 
 async def cmd_addword(update, context):
     if not is_admin(update.effective_user.id): return
     if not context.args: await update.message.reply_text("❌ /addword слово"); return
-    word = context.args[0].strip().lower()
+    # Сохраняем слово как есть (без lower(), с пробелами)
+    word = " ".join(context.args).strip()
     keywords = load_keywords()
-    if word in keywords: await update.message.reply_text(f"⚠️ '{word}' уже в списке."); return
+    if word.lower() in [k.lower() for k in keywords]:
+        await update.message.reply_text(f"⚠️ '{word}' уже в списке."); return
     keywords.append(word)
     save_keywords(keywords)
     await update.message.reply_text(f"✅ '{word}' добавлен. Всего: {len(keywords)}")
 
 async def cmd_addwords(update, context):
     if not is_admin(update.effective_user.id): return
-    if not context.args: await update.message.reply_text("❌ /addwords слово1 слово2 ..."); return
+    if not context.args: await update.message.reply_text("❌ /addwords слово1, слово2, фраза ..."); return
     raw_input = " ".join(context.args)
-    words = re.split(r'[,\s;\n]+', raw_input)
-    words = [w.strip().lower() for w in words if w.strip()]
+    # Разделяем по запятым и переводам строк (НЕ по пробелам)
+    words = re.split(r'[,\n]+', raw_input)
+    words = [w.strip() for w in words if w.strip()]
     if not words: await update.message.reply_text("❌ Не удалось распознать слова."); return
     keywords = load_keywords()
     added, skipped = [], []
     for word in words:
-        if word in keywords: skipped.append(word)
-        else: keywords.append(word); added.append(word)
+        if word.lower() in [k.lower() for k in keywords]:
+            skipped.append(word)
+        else:
+            keywords.append(word)
+            added.append(word)
     save_keywords(keywords)
     report = []
     if added: report.append(f"✅ Добавлены ({len(added)}): {', '.join(added)}")
@@ -416,12 +452,45 @@ async def cmd_addwords(update, context):
 async def cmd_removeword(update, context):
     if not is_admin(update.effective_user.id): return
     if not context.args: await update.message.reply_text("❌ /removeword слово"); return
-    word = context.args[0].strip().lower()
+    word = " ".join(context.args).strip()
     keywords = load_keywords()
-    if word not in keywords: await update.message.reply_text(f"⚠️ '{word}' не найден."); return
-    keywords.remove(word)
+    found = None
+    for kw in keywords:
+        if kw.lower() == word.lower():
+            found = kw
+            break
+    if not found: await update.message.reply_text(f"⚠️ '{word}' не найден."); return
+    keywords.remove(found)
     save_keywords(keywords)
-    await update.message.reply_text(f"✅ '{word}' удалён. Всего: {len(keywords)}")
+    await update.message.reply_text(f"✅ '{found}' удалён. Всего: {len(keywords)}")
+
+async def cmd_removemanywords(update, context):
+    if not is_admin(update.effective_user.id): return
+    if not context.args: await update.message.reply_text("❌ /removemanywords слово1, слово2, ..."); return
+    raw_input = " ".join(context.args)
+    words = re.split(r'[,\n]+', raw_input)
+    words = [w.strip() for w in words if w.strip()]
+    if not words: await update.message.reply_text("❌ Не удалось распознать слова."); return
+
+    keywords = load_keywords()
+    removed, not_found = [], []
+    for word in words:
+        found = None
+        for kw in keywords:
+            if kw.lower() == word.lower():
+                found = kw
+                break
+        if found:
+            keywords.remove(found)
+            removed.append(found)
+        else:
+            not_found.append(word)
+
+    save_keywords(keywords)
+    report = []
+    if removed: report.append(f"✅ Удалены ({len(removed)}): {', '.join(removed)}")
+    if not_found: report.append(f"⚠️ Не найдены ({len(not_found)}): {', '.join(not_found)}")
+    await update.message.reply_text("\n\n".join(report) + f"\n\n🔑 Всего: {len(keywords)}")
 
 async def cmd_listwords(update, context):
     if not is_admin(update.effective_user.id): return
@@ -548,15 +617,17 @@ async def main():
     app.add_handler(CommandHandler("addblogger", cmd_addblogger))
     app.add_handler(CommandHandler("addmanyblogger", cmd_addmanyblogger))
     app.add_handler(CommandHandler("removeblogger", cmd_removeblogger))
+    app.add_handler(CommandHandler("removemanyblogger", cmd_removemanyblogger))
     app.add_handler(CommandHandler("listbloggers", cmd_listbloggers))
     app.add_handler(CommandHandler("addword", cmd_addword))
     app.add_handler(CommandHandler("addwords", cmd_addwords))
     app.add_handler(CommandHandler("removeword", cmd_removeword))
+    app.add_handler(CommandHandler("removemanywords", cmd_removemanywords))
     app.add_handler(CommandHandler("listwords", cmd_listwords))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("force", cmd_force))
     asyncio.create_task(scheduled_check(bot))
-    logger.info("🤖 Бот запущен (финальная версия)")
+    logger.info("🤖 Бот запущен (финал)")
     await app.run_polling()
 
 if __name__ == "__main__":
