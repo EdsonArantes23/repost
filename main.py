@@ -86,8 +86,6 @@ def clean_html(text):
 def extract_images(entry):
     """Извлекает ТОЛЬКО картинки из RSS-записи."""
     images = []
-
-    # Берём сырой description
     raw_desc = getattr(entry, "description", "") or getattr(entry, "summary", "")
 
     # Способ 1: img теги в сыром HTML
@@ -122,20 +120,24 @@ def extract_images(entry):
     return images
 
 def extract_text(entry):
-    """Извлекает ТОЛЬКО текст из RSS-записи."""
+    """Извлекает текст и внешние ссылки из RSS-записи."""
     description = getattr(entry, "description", "") or getattr(entry, "summary", "")
 
     if description:
-        # Убираем quote-блок
         clean_desc = re.split(r'<hr[^>]*>|<div class="rsshub-quote">', description)[0]
-        # Заменяем <br> на переносы строк
         text_with_breaks = re.sub(r'<br\s*/?>', '\n', clean_desc)
-        # Убираем все HTML-теги
         text = clean_html(text_with_breaks)
+
         if text:
+            # Ищем внешние ссылки (не twitter, не медиа)
+            external_urls = re.findall(r'https?://[^\s"\'<&]+', description)
+            for url in external_urls:
+                if any(d in url for d in ['x.com', 'twitter.com', 'pbs.twimg.com', 'video.twimg.com']):
+                    continue
+                if url not in text:
+                    text = text + "\n" + url
             return text
 
-    # Fallback на title
     title = getattr(entry, "title", "") or ""
     return clean_html(title)
 
@@ -144,14 +146,12 @@ def extract_videos(entry):
     videos = []
     raw_desc = getattr(entry, "description", "") or getattr(entry, "summary", "")
 
-    # <video src="...">
     video_urls = re.findall(r'<video[^>]+src="([^"]+)"', raw_desc)
     for url in video_urls:
         url = url.replace("&amp;", "&")
         if url not in videos:
             videos.append(url)
 
-    # <source src="..."> внутри <video>
     source_urls = re.findall(r'<source[^>]+src="([^"]+)"', raw_desc)
     for url in source_urls:
         url = url.replace("&amp;", "&")
@@ -556,7 +556,7 @@ async def main():
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("force", cmd_force))
     asyncio.create_task(scheduled_check(bot))
-    logger.info("🤖 Бот запущен (финал)")
+    logger.info("🤖 Бот запущен (финальная версия)")
     await app.run_polling()
 
 if __name__ == "__main__":
