@@ -83,50 +83,82 @@ def clean_html(text):
     text = text.strip()
     return text
 
-def extract_text_and_media(entry):
+def extract_images(entry):
+    """Извлекает ТОЛЬКО картинки из RSS-записи."""
     images = []
-    videos = []
-    text = ""
 
+    # Берём сырой description
+    raw_desc = getattr(entry, "description", "") or getattr(entry, "summary", "")
+
+    # Способ 1: img теги в сыром HTML
+    img_urls = re.findall(r'<img[^>]+src="([^"]+)"', raw_desc)
+    for url in img_urls:
+        url = url.replace("&amp;", "&")
+        if url not in images and "pbs.twimg.com" in url:
+            images.append(url)
+
+    # Способ 2: media_content (стандарт RSS)
+    if not images and hasattr(entry, "media_content") and entry.media_content:
+        for media in entry.media_content:
+            url = media.get("url", "").replace("&amp;", "&")
+            if url and url not in images:
+                images.append(url)
+
+    # Способ 3: прямые ссылки на pbs.twimg.com в тексте
+    if not images:
+        direct_urls = re.findall(r'https?://pbs\.twimg\.com/media/[^\s"\'&]+', raw_desc)
+        for url in direct_urls:
+            url = url.replace("&amp;", "&")
+            if url not in images:
+                images.append(url)
+
+    # Способ 4: enclosure (ещё один стандарт RSS)
+    if not images and hasattr(entry, "enclosures") and entry.enclosures:
+        for enc in entry.enclosures:
+            url = enc.get("href", "").replace("&amp;", "&")
+            if url and url not in images and "image" in enc.get("type", ""):
+                images.append(url)
+
+    return images
+
+def extract_text(entry):
+    """Извлекает ТОЛЬКО текст из RSS-записи."""
     description = getattr(entry, "description", "") or getattr(entry, "summary", "")
 
     if description:
+        # Убираем quote-блок
         clean_desc = re.split(r'<hr[^>]*>|<div class="rsshub-quote">', description)[0]
+        # Заменяем <br> на переносы строк
         text_with_breaks = re.sub(r'<br\s*/?>', '\n', clean_desc)
+        # Убираем все HTML-теги
         text = clean_html(text_with_breaks)
+        if text:
+            return text
 
-        img_urls = re.findall(r'<img[^>]+src="([^"]+)"', clean_desc)
-        for url in img_urls:
-            url = url.replace("&amp;", "&")
-            if url not in images and "pbs.twimg.com" in url:
-                images.append(url)
+    # Fallback на title
+    title = getattr(entry, "title", "") or ""
+    return clean_html(title)
 
-        if not images:
-            direct_urls = re.findall(r'https?://pbs\.twimg\.com/media/[^\s"\'&]+', description)
-            for url in direct_urls:
-                url = url.replace("&amp;", "&")
-                if url not in images:
-                    images.append(url)
+def extract_videos(entry):
+    """Извлекает ТОЛЬКО видео из RSS-записи."""
+    videos = []
+    raw_desc = getattr(entry, "description", "") or getattr(entry, "summary", "")
 
-        video_urls = re.findall(r'<video[^>]+src="([^"]+)"', description)
-        for url in video_urls:
-            url = url.replace("&amp;", "&")
-            if url not in videos:
-                videos.append(url)
+    # <video src="...">
+    video_urls = re.findall(r'<video[^>]+src="([^"]+)"', raw_desc)
+    for url in video_urls:
+        url = url.replace("&amp;", "&")
+        if url not in videos:
+            videos.append(url)
 
-        # Также ищем видео внутри <source> тегов
-        if not video_urls:
-            source_urls = re.findall(r'<source[^>]+src="([^"]+)"', description)
-            for url in source_urls:
-                url = url.replace("&amp;", "&")
-                if url not in videos:
-                    videos.append(url)
+    # <source src="..."> внутри <video>
+    source_urls = re.findall(r'<source[^>]+src="([^"]+)"', raw_desc)
+    for url in source_urls:
+        url = url.replace("&amp;", "&")
+        if url not in videos:
+            videos.append(url)
 
-    if not text:
-        title = getattr(entry, "title", "") or ""
-        text = clean_html(title)
-
-    return text, images, videos
+    return videos
 
 async def fetch_tweets(username):
     url = f"{RSSHUB_URL}/twitter/user/{username}"
@@ -152,8 +184,11 @@ async def fetch_tweets(username):
 
                 tweets = []
                 for entry in feed.entries:
-                    text, images, videos = extract_text_and_media(entry)
+                    text = extract_text(entry)
+                    images = extract_images(entry)
+                    videos = extract_videos(entry)
                     link = entry.link if hasattr(entry, "link") else ""
+
                     tweets.append({
                         "text": text, "link": link,
                         "images": images, "videos": videos,
@@ -418,14 +453,9 @@ async def send_post(bot: Bot, tweet, username):
 
     try:
         if videos:
-            # Вместо отправки видео — добавляем ссылку в текст (быстрее)
             video_link = videos[0]
             full_text = f"{text}\n\n🎬 Video: {video_link}\n\n{tweet['display_name']} | https://x.com/{username}"
-            await bot.send_message(
-                TELEGRAM_CHANNEL_ID,
-                full_text[:4096],
-                disable_web_page_preview=True
-            )
+            await bot.send_message(TELEGRAM_CHANNEL_ID, full_text[:4096], disable_web_page_preview=True)
         elif images:
             signature = f"\n\n{tweet['display_name']} | https://x.com/{username}"
             full_text = text + signature
@@ -526,7 +556,7 @@ async def main():
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("force", cmd_force))
     asyncio.create_task(scheduled_check(bot))
-    logger.info("🤖 Бот запущен (финальная версия)")
+    logger.info("🤖 Бот запущен (финал)")
     await app.run_polling()
 
 if __name__ == "__main__":
