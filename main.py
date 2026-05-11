@@ -30,19 +30,16 @@ FANS_FILE = "chelsea_fans.txt"
 BLOGGERS_FILE = "general_bloggers.txt"
 KEYWORDS_FILE = "keywords.txt"
 
-# Ограничение одновременных запросов к Render
 MAX_PARALLEL = 10
 semaphore = asyncio.Semaphore(MAX_PARALLEL)
 
 sent_posts_cache = set()
 adding_lock = asyncio.Lock()
 
-# Время запуска бота (автоматически)
 BOOT_TIME = None
 
 # --- ВРЕМЯ ЗАПУСКА БОТА ---
 def get_boot_time():
-    """Возвращает время первого запуска бота. Создаёт метку, если её нет."""
     global BOOT_TIME
     if BOOT_TIME:
         return BOOT_TIME
@@ -57,7 +54,6 @@ def get_boot_time():
     except FileNotFoundError:
         pass
 
-    # Метки нет — создаём
     BOOT_TIME = datetime.now(timezone.utc)
     with open(SENT_POSTS_FILE, "a") as f:
         f.write(f"BOOT_TIME:{BOOT_TIME.isoformat()}\n")
@@ -102,22 +98,28 @@ def save_sent_post(post_id):
         f.write(post_id + "\n")
 
 def post_matches_filter(text, keywords):
+    """Точное совпадение слов с границами \b."""
     if not keywords:
         return True
     text_lower = text.lower()
     for kw in keywords:
-        if kw.lower() in text_lower:
+        pattern = r'\b' + re.escape(kw.lower()) + r'\b'
+        if re.search(pattern, text_lower):
             return True
     return False
 
+def escape_html(text):
+    """Экранирует HTML-спецсимволы, кроме наших тегов."""
+    return text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+
 def clean_html(text):
+    """Убирает HTML-теги и entities из текста."""
     text = re.sub(r'<[^>]+>', '', text)
     text = text.replace('&lt;', '<').replace('&gt;', '>').replace('&amp;', '&')
     text = text.replace('&#39;', "'").replace('&quot;', '"')
     text = text.replace('&nbsp;', ' ')
     text = re.sub(r'\n\s*\n', '\n\n', text)
-    text = text.strip()
-    return text
+    return text.strip()
 
 def extract_images(entry):
     images = []
@@ -198,7 +200,6 @@ def extract_videos(entry):
     return videos
 
 async def fetch_tweets(username):
-    """Получает твиты (без семафора — вызывается только через fetch_tweets_with_limit)."""
     url = f"{RSSHUB_URL}/twitter/user/{username}"
 
     for attempt in range(2):
@@ -256,12 +257,10 @@ async def fetch_tweets(username):
     return username, []
 
 async def fetch_tweets_with_limit(username):
-    """fetch_tweets с ограничением одновременных запросов."""
     async with semaphore:
         return await fetch_tweets(username)
 
 async def fetch_all_tweets(usernames):
-    """Параллельно получает твиты, но не более MAX_PARALLEL одновременно."""
     tasks = [fetch_tweets_with_limit(username) for username in usernames]
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -282,7 +281,6 @@ def extract_tweet_id(tweet):
     return int(match.group(1)) if match else 0
 
 async def mark_all_current_as_sent(username):
-    """Отмечает все текущие твиты как отправленные (использует семафор)."""
     _, tweets = await fetch_tweets_with_limit(username)
     if tweets:
         sent_posts = load_sent_posts()
@@ -297,7 +295,6 @@ async def mark_all_current_as_sent(username):
     return 0
 
 def is_tweet_too_old(tweet, username=None):
-    """Проверяет, не был ли твит опубликован ДО запуска бота."""
     boot_time = get_boot_time()
     if not boot_time:
         return False
@@ -582,15 +579,18 @@ async def send_post(bot: Bot, tweet, username):
     display_name = tweet["display_name"]
     post_link = tweet["link"]
 
+    # Экранируем HTML в тексте, чтобы не сломать форматирование
+    safe_text = escape_html(text)
+    # Подпись с жирным автором
     signature = f"\n\n<b>{display_name}</b> | https://x.com/{username}\n\n🔗 Post link: {post_link}"
 
     try:
         if videos:
             video_link = videos[0]
-            full_text = f"{text}\n\n🎬 Video: {video_link}{signature}"
+            full_text = f"{safe_text}\n\n🎬 Video: {video_link}{signature}"
             await bot.send_message(TELEGRAM_CHANNEL_ID, full_text[:4096], parse_mode='HTML', disable_web_page_preview=True)
         elif images:
-            full_text = text + signature
+            full_text = safe_text + signature
             if len(images) == 1:
                 await bot.send_photo(TELEGRAM_CHANNEL_ID, images[0], caption=full_text[:1024], parse_mode='HTML')
             else:
@@ -602,12 +602,14 @@ async def send_post(bot: Bot, tweet, username):
                         media.append(InputMediaPhoto(media=img))
                 await bot.send_media_group(TELEGRAM_CHANNEL_ID, media)
         else:
-            full_text = text + signature
+            full_text = safe_text + signature
             await bot.send_message(TELEGRAM_CHANNEL_ID, full_text, parse_mode='HTML', disable_web_page_preview=True)
     except TelegramError as e:
         logger.error(f"Ошибка отправки: {e}")
         try:
-            await bot.send_message(TELEGRAM_CHANNEL_ID, text + f"\n\n{display_name} | https://x.com/{username}\n\n🔗 Post link: {post_link}"[:4096], disable_web_page_preview=True)
+            # Fallback без HTML-форматирования
+            fallback = text + f"\n\n{display_name} | https://x.com/{username}\n\n🔗 Post link: {post_link}"
+            await bot.send_message(TELEGRAM_CHANNEL_ID, fallback[:4096], disable_web_page_preview=True)
         except:
             pass
 
@@ -675,9 +677,7 @@ async def main():
         logger.critical("❌ Нет BOT_TOKEN!")
         return
 
-    # Устанавливаем время запуска бота
     boot_time = get_boot_time()
-
     sent_posts_cache = load_sent_posts()
     bot = Bot(token=TELEGRAM_BOT_TOKEN)
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
