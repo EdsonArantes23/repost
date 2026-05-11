@@ -29,7 +29,6 @@ SENT_POSTS_FILE = "sent_posts.txt"
 FANS_FILE = "chelsea_fans.txt"
 BLOGGERS_FILE = "general_bloggers.txt"
 KEYWORDS_FILE = "keywords.txt"
-CHANNEL_TIMES_FILE = "channel_times.txt"
 
 # Ограничение одновременных запросов к Render
 MAX_PARALLEL = 10
@@ -37,6 +36,34 @@ semaphore = asyncio.Semaphore(MAX_PARALLEL)
 
 sent_posts_cache = set()
 adding_lock = asyncio.Lock()
+
+# Время запуска бота (автоматически)
+BOOT_TIME = None
+
+# --- ВРЕМЯ ЗАПУСКА БОТА ---
+def get_boot_time():
+    """Возвращает время первого запуска бота. Создаёт метку, если её нет."""
+    global BOOT_TIME
+    if BOOT_TIME:
+        return BOOT_TIME
+
+    try:
+        with open(SENT_POSTS_FILE, "r") as f:
+            for line in f:
+                if line.startswith("BOOT_TIME:"):
+                    BOOT_TIME = datetime.fromisoformat(line.strip().split(":", 1)[1].strip())
+                    logger.info(f"🕒 Найдено время запуска: {BOOT_TIME.isoformat()}")
+                    return BOOT_TIME
+    except FileNotFoundError:
+        pass
+
+    # Метки нет — создаём
+    BOOT_TIME = datetime.now(timezone.utc)
+    with open(SENT_POSTS_FILE, "a") as f:
+        f.write(f"BOOT_TIME:{BOOT_TIME.isoformat()}\n")
+    logger.info(f"🕒 Установлено время запуска: {BOOT_TIME.isoformat()}")
+    logger.info("📌 Твиты старше этого времени не будут отправлены")
+    return BOOT_TIME
 
 # --- ЗАГРУЗКА/СОХРАНЕНИЕ ---
 def load_list(filename):
@@ -59,34 +86,11 @@ def save_bloggers(bloggers): save_list(BLOGGERS_FILE, bloggers)
 def load_keywords(): return load_list(KEYWORDS_FILE)
 def save_keywords(keywords): save_list(KEYWORDS_FILE, keywords)
 
-def save_channel_added_time(username, add_time=None):
-    times = {}
-    try:
-        with open(CHANNEL_TIMES_FILE, "r") as f:
-            for line in f:
-                parts = line.strip().split("|", 1)
-                if len(parts) == 2:
-                    times[parts[0]] = parts[1]
-    except FileNotFoundError:
-        pass
-
-    if add_time:
-        times[username] = add_time.isoformat()
-        with open(CHANNEL_TIMES_FILE, "w") as f:
-            for u, t in times.items():
-                f.write(f"{u}|{t}\n")
-        return add_time
-    else:
-        time_str = times.get(username)
-        if time_str:
-            return datetime.fromisoformat(time_str)
-    return None
-
 def load_sent_posts():
     global sent_posts_cache
     try:
         with open(SENT_POSTS_FILE, "r") as f:
-            sent_posts_cache = set(line.strip() for line in f)
+            sent_posts_cache = set(line.strip() for line in f if not line.startswith("BOOT_TIME:"))
     except FileNotFoundError:
         sent_posts_cache = set()
     return sent_posts_cache
@@ -289,13 +293,13 @@ async def mark_all_current_as_sent(username):
                 sent_posts.add(link)
                 save_sent_post(link)
                 count += 1
-        save_channel_added_time(username, datetime.now(timezone.utc))
         return count
     return 0
 
-def is_tweet_too_old(tweet, username):
-    added_time = save_channel_added_time(username)
-    if not added_time:
+def is_tweet_too_old(tweet, username=None):
+    """Проверяет, не был ли твит опубликован ДО запуска бота."""
+    boot_time = get_boot_time()
+    if not boot_time:
         return False
 
     published_str = tweet.get("published")
@@ -304,7 +308,7 @@ def is_tweet_too_old(tweet, username):
 
     try:
         tweet_time = parsedate_to_datetime(published_str)
-        return tweet_time < added_time
+        return tweet_time < boot_time
     except:
         return False
 
@@ -640,7 +644,7 @@ async def check_and_post(bot: Bot):
 
         username = tweet["username"]
 
-        if is_tweet_too_old(tweet, username):
+        if is_tweet_too_old(tweet):
             continue
 
         if username in bloggers and username not in fans:
@@ -670,6 +674,10 @@ async def main():
     if not TELEGRAM_BOT_TOKEN:
         logger.critical("❌ Нет BOT_TOKEN!")
         return
+
+    # Устанавливаем время запуска бота
+    boot_time = get_boot_time()
+
     sent_posts_cache = load_sent_posts()
     bot = Bot(token=TELEGRAM_BOT_TOKEN)
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
@@ -691,7 +699,8 @@ async def main():
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("force", cmd_force))
     asyncio.create_task(scheduled_check(bot))
-    logger.info("🤖 Бот запущен (все вызовы через семафор)")
+    logger.info(f"🤖 Бот запущен (время старта: {boot_time.isoformat()})")
+    logger.info("📌 Твиты старше этого времени не будут отправлены")
     await app.run_polling()
 
 if __name__ == "__main__":
