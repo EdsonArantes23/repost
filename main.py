@@ -67,15 +67,10 @@ def save_sent_post(post_id):
         f.write(post_id + "\n")
 
 def post_matches_filter(text, keywords):
-    """
-    Проверяет, содержит ли текст ключевые слова.
-    Ищет ТОЧНОЕ совпадение фразы целиком (не разбивает на отдельные слова).
-    """
     if not keywords:
         return True
     text_lower = text.lower()
     for kw in keywords:
-        # Ищем точное совпадение фразы
         if kw.lower() in text_lower:
             return True
     return False
@@ -235,6 +230,12 @@ async def fetch_all_tweets(usernames):
             all_tweets.extend(tweets)
 
     return all_tweets
+
+def extract_tweet_id(tweet):
+    """Извлекает числовой ID твита из ссылки для сортировки."""
+    link = tweet.get("link", "")
+    match = re.search(r'/status/(\d+)', link)
+    return int(match.group(1)) if match else 0
 
 async def mark_all_current_as_sent(username):
     _, tweets = await fetch_tweets(username)
@@ -418,7 +419,6 @@ async def cmd_listbloggers(update, context):
 async def cmd_addword(update, context):
     if not is_admin(update.effective_user.id): return
     if not context.args: await update.message.reply_text("❌ /addword слово"); return
-    # Сохраняем слово как есть (без lower(), с пробелами)
     word = " ".join(context.args).strip()
     keywords = load_keywords()
     if word.lower() in [k.lower() for k in keywords]:
@@ -431,7 +431,6 @@ async def cmd_addwords(update, context):
     if not is_admin(update.effective_user.id): return
     if not context.args: await update.message.reply_text("❌ /addwords слово1, слово2, фраза ..."); return
     raw_input = " ".join(context.args)
-    # Разделяем по запятым и переводам строк (НЕ по пробелам)
     words = re.split(r'[,\n]+', raw_input)
     words = [w.strip() for w in words if w.strip()]
     if not words: await update.message.reply_text("❌ Не удалось распознать слова."); return
@@ -570,6 +569,10 @@ async def check_and_post(bot: Bot):
     elapsed = time.time() - start_time
     logger.info(f"⏱ Проверка заняла {elapsed:.1f} сек, получено {len(all_tweets)} твитов")
 
+    # Сортируем по ID твита (от старых к новым)
+    # В Telegram последнее отправленное — сверху → новый твит будет первым
+    all_tweets.sort(key=extract_tweet_id)
+
     keywords = load_keywords()
     new_posts = 0
 
@@ -627,7 +630,7 @@ async def main():
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("force", cmd_force))
     asyncio.create_task(scheduled_check(bot))
-    logger.info("🤖 Бот запущен (финал)")
+    logger.info("🤖 Бот запущен (с сортировкой по времени)")
     await app.run_polling()
 
 if __name__ == "__main__":
