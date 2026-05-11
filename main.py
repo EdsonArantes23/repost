@@ -55,7 +55,6 @@ def load_keywords(): return load_list(KEYWORDS_FILE)
 def save_keywords(keywords): save_list(KEYWORDS_FILE, keywords)
 
 def save_channel_added_time(username, add_time=None):
-    """Сохраняет или читает время добавления канала."""
     times = {}
     try:
         with open(CHANNEL_TIMES_FILE, "r") as f:
@@ -106,6 +105,7 @@ def clean_html(text):
     text = re.sub(r'<[^>]+>', '', text)
     text = text.replace('&lt;', '<').replace('&gt;', '>').replace('&amp;', '&')
     text = text.replace('&#39;', "'").replace('&quot;', '"')
+    text = text.replace('&nbsp;', ' ')
     text = re.sub(r'\n\s*\n', '\n\n', text)
     text = text.strip()
     return text
@@ -261,13 +261,11 @@ async def fetch_all_tweets(usernames):
     return all_tweets
 
 def extract_tweet_id(tweet):
-    """Извлекает числовой ID твита из ссылки для сортировки."""
     link = tweet.get("link", "")
     match = re.search(r'/status/(\d+)', link)
     return int(match.group(1)) if match else 0
 
 async def mark_all_current_as_sent(username):
-    """Отмечает все текущие твиты как отправленные и запоминает время добавления."""
     _, tweets = await fetch_tweets(username)
     if tweets:
         sent_posts = load_sent_posts()
@@ -278,24 +276,21 @@ async def mark_all_current_as_sent(username):
                 sent_posts.add(link)
                 save_sent_post(link)
                 count += 1
-        # Запоминаем время добавления канала
         save_channel_added_time(username, datetime.now(timezone.utc))
         return count
     return 0
 
 def is_tweet_too_old(tweet, username):
-    """Проверяет, не был ли твит опубликован до добавления канала."""
     added_time = save_channel_added_time(username)
     if not added_time:
-        return False  # Если время не сохранено — пропускаем всё
+        return False
 
     published_str = tweet.get("published")
     if not published_str:
-        return False  # Если даты нет — пропускаем
+        return False
 
     try:
         tweet_time = parsedate_to_datetime(published_str)
-        # Если твит старше времени добавления — пропускаем
         return tweet_time < added_time
     except:
         return False
@@ -326,7 +321,7 @@ async def cmd_addfan(update, context):
             fans.append(username)
             save_fans(fans)
             count = await mark_all_current_as_sent(username)
-            await update.message.reply_text(f"✅ {display_name} (@{username}) добавлен.\n📤 {count} постов пропущено.\n🕒 Время добавления сохранено.")
+            await update.message.reply_text(f"✅ {display_name} (@{username}) добавлен.\n📤 {count} постов пропущено.")
         except Exception as e:
             await update.message.reply_text(f"❌ Ошибка: {e}")
 
@@ -389,7 +384,7 @@ async def cmd_addblogger(update, context):
             bloggers.append(username)
             save_bloggers(bloggers)
             count = await mark_all_current_as_sent(username)
-            await update.message.reply_text(f"✅ {display_name} (@{username}) добавлен.\n📤 {count} постов пропущено.\n🕒 Время добавления сохранено.")
+            await update.message.reply_text(f"✅ {display_name} (@{username}) добавлен.\n📤 {count} постов пропущено.")
         except Exception as e:
             await update.message.reply_text(f"❌ Ошибка: {e}")
 
@@ -567,33 +562,35 @@ async def send_post(bot: Bot, tweet, username):
     text = tweet["text"]
     images = tweet["images"]
     videos = tweet["videos"]
+    display_name = tweet["display_name"]
+    post_link = tweet["link"]
+
+    signature = f"\n\n<b>{display_name}</b> | https://x.com/{username}\n\n🔗 Post link: {post_link}"
 
     try:
         if videos:
             video_link = videos[0]
-            full_text = f"{text}\n\n🎬 Video: {video_link}\n\n{tweet['display_name']} | https://x.com/{username}"
-            await bot.send_message(TELEGRAM_CHANNEL_ID, full_text[:4096], disable_web_page_preview=True)
+            full_text = f"{text}\n\n🎬 Video: {video_link}{signature}"
+            await bot.send_message(TELEGRAM_CHANNEL_ID, full_text[:4096], parse_mode='HTML', disable_web_page_preview=True)
         elif images:
-            signature = f"\n\n{tweet['display_name']} | https://x.com/{username}"
             full_text = text + signature
             if len(images) == 1:
-                await bot.send_photo(TELEGRAM_CHANNEL_ID, images[0], caption=full_text[:1024])
+                await bot.send_photo(TELEGRAM_CHANNEL_ID, images[0], caption=full_text[:1024], parse_mode='HTML')
             else:
                 media = []
                 for i, img in enumerate(images[:10]):
                     if i == 0:
-                        media.append(InputMediaPhoto(media=img, caption=full_text[:1024]))
+                        media.append(InputMediaPhoto(media=img, caption=full_text[:1024], parse_mode='HTML'))
                     else:
                         media.append(InputMediaPhoto(media=img))
                 await bot.send_media_group(TELEGRAM_CHANNEL_ID, media)
         else:
-            signature = f"\n\n{tweet['display_name']} | https://x.com/{username}"
             full_text = text + signature
-            await bot.send_message(TELEGRAM_CHANNEL_ID, full_text, disable_web_page_preview=True)
+            await bot.send_message(TELEGRAM_CHANNEL_ID, full_text, parse_mode='HTML', disable_web_page_preview=True)
     except TelegramError as e:
         logger.error(f"Ошибка отправки: {e}")
         try:
-            await bot.send_message(TELEGRAM_CHANNEL_ID, full_text[:4096], disable_web_page_preview=True)
+            await bot.send_message(TELEGRAM_CHANNEL_ID, text + f"\n\n{display_name} | https://x.com/{username}\n\n🔗 Post link: {post_link}"[:4096], disable_web_page_preview=True)
         except:
             pass
 
@@ -618,7 +615,6 @@ async def check_and_post(bot: Bot):
     elapsed = time.time() - start_time
     logger.info(f"⏱ Проверка заняла {elapsed:.1f} сек, получено {len(all_tweets)} твитов")
 
-    # Сортируем по ID твита — от старых к новым
     all_tweets.sort(key=extract_tweet_id)
 
     keywords = load_keywords()
@@ -631,7 +627,6 @@ async def check_and_post(bot: Bot):
 
         username = tweet["username"]
 
-        # Пропускаем твиты, опубликованные ДО добавления канала
         if is_tweet_too_old(tweet, username):
             continue
 
@@ -683,7 +678,7 @@ async def main():
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("force", cmd_force))
     asyncio.create_task(scheduled_check(bot))
-    logger.info("🤖 Бот запущен (защита от старых твитов + сортировка)")
+    logger.info("🤖 Бот запущен (финальная версия)")
     await app.run_polling()
 
 if __name__ == "__main__":
