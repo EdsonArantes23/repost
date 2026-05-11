@@ -3,6 +3,7 @@ import os
 import logging
 import re
 import time
+import random
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 
@@ -29,6 +30,10 @@ FANS_FILE = "chelsea_fans.txt"
 BLOGGERS_FILE = "general_bloggers.txt"
 KEYWORDS_FILE = "keywords.txt"
 CHANNEL_TIMES_FILE = "channel_times.txt"
+
+# Ограничение одновременных запросов к Render
+MAX_PARALLEL = 15
+semaphore = asyncio.Semaphore(MAX_PARALLEL)
 
 sent_posts_cache = set()
 adding_lock = asyncio.Lock()
@@ -245,14 +250,20 @@ async def fetch_tweets(username):
     logger.error(f"❌ @{username}: не удалось после 2 попыток")
     return username, []
 
+async def fetch_tweets_with_limit(username):
+    """fetch_tweets с ограничением одновременных запросов."""
+    async with semaphore:
+        return await fetch_tweets(username)
+
 async def fetch_all_tweets(usernames):
-    tasks = [fetch_tweets(username) for username in usernames]
+    """Параллельно получает твиты, но не более MAX_PARALLEL одновременно."""
+    tasks = [fetch_tweets_with_limit(username) for username in usernames]
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
     all_tweets = []
     for result in results:
         if isinstance(result, Exception):
-            logger.error(f"❌ Ошибка при параллельной проверке: {result}")
+            logger.error(f"❌ Ошибка при проверке: {result}")
             continue
         display_name, tweets = result
         if tweets:
@@ -609,7 +620,7 @@ async def check_and_post(bot: Bot):
     if not sent_posts_cache:
         sent_posts_cache = load_sent_posts()
 
-    logger.info(f"🔄 Параллельная проверка {len(all_usernames)} каналов...")
+    logger.info(f"🔄 Параллельная проверка {len(all_usernames)} каналов (макс {MAX_PARALLEL} одновременно)...")
     start_time = time.time()
     all_tweets = await fetch_all_tweets(all_usernames)
     elapsed = time.time() - start_time
@@ -678,7 +689,7 @@ async def main():
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("force", cmd_force))
     asyncio.create_task(scheduled_check(bot))
-    logger.info("🤖 Бот запущен (финальная версия)")
+    logger.info("🤖 Бот запущен (финальная версия с ограничением запросов)")
     await app.run_polling()
 
 if __name__ == "__main__":
