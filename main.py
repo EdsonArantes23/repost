@@ -32,7 +32,7 @@ KEYWORDS_FILE = "keywords.txt"
 CHANNEL_TIMES_FILE = "channel_times.txt"
 
 # Ограничение одновременных запросов к Render
-MAX_PARALLEL = 15
+MAX_PARALLEL = 10
 semaphore = asyncio.Semaphore(MAX_PARALLEL)
 
 sent_posts_cache = set()
