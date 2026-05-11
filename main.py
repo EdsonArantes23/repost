@@ -194,11 +194,12 @@ def extract_videos(entry):
     return videos
 
 async def fetch_tweets(username):
+    """Получает твиты (без семафора — вызывается только через fetch_tweets_with_limit)."""
     url = f"{RSSHUB_URL}/twitter/user/{username}"
 
     for attempt in range(2):
         try:
-            async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+            async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
                 headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/rss+xml, */*"}
                 response = await client.get(url, headers=headers)
 
@@ -277,7 +278,8 @@ def extract_tweet_id(tweet):
     return int(match.group(1)) if match else 0
 
 async def mark_all_current_as_sent(username):
-    _, tweets = await fetch_tweets(username)
+    """Отмечает все текущие твиты как отправленные (использует семафор)."""
+    _, tweets = await fetch_tweets_with_limit(username)
     if tweets:
         sent_posts = load_sent_posts()
         count = 0
@@ -328,7 +330,7 @@ async def cmd_addfan(update, context):
     async with adding_lock:
         await update.message.reply_text(f"⏳ Добавляю @{username}...")
         try:
-            display_name, _ = await fetch_tweets(username)
+            display_name, _ = await fetch_tweets_with_limit(username)
             fans.append(username)
             save_fans(fans)
             count = await mark_all_current_as_sent(username)
@@ -351,7 +353,7 @@ async def cmd_addmanyfan(update, context):
         for username in usernames:
             if username in fans: skipped.append(f"• @{username}"); continue
             try:
-                display_name, _ = await fetch_tweets(username)
+                display_name, _ = await fetch_tweets_with_limit(username)
                 fans.append(username)
                 save_fans(fans)
                 count = await mark_all_current_as_sent(username)
@@ -391,7 +393,7 @@ async def cmd_addblogger(update, context):
     async with adding_lock:
         await update.message.reply_text(f"⏳ Добавляю @{username}...\n{kw_msg}")
         try:
-            display_name, _ = await fetch_tweets(username)
+            display_name, _ = await fetch_tweets_with_limit(username)
             bloggers.append(username)
             save_bloggers(bloggers)
             count = await mark_all_current_as_sent(username)
@@ -416,7 +418,7 @@ async def cmd_addmanyblogger(update, context):
         for username in usernames:
             if username in bloggers: skipped.append(f"• @{username}"); continue
             try:
-                display_name, _ = await fetch_tweets(username)
+                display_name, _ = await fetch_tweets_with_limit(username)
                 bloggers.append(username)
                 save_bloggers(bloggers)
                 count = await mark_all_current_as_sent(username)
@@ -689,7 +691,7 @@ async def main():
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("force", cmd_force))
     asyncio.create_task(scheduled_check(bot))
-    logger.info("🤖 Бот запущен (финальная версия с ограничением запросов)")
+    logger.info("🤖 Бот запущен (все вызовы через семафор)")
     await app.run_polling()
 
 if __name__ == "__main__":
