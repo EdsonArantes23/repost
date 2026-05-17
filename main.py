@@ -9,6 +9,7 @@ from email.utils import parsedate_to_datetime
 
 import httpx
 import nest_asyncio
+import feedparser
 from bs4 import BeautifulSoup
 from telegram import Bot, InputMediaPhoto
 from telegram.error import TelegramError
@@ -23,12 +24,23 @@ TELEGRAM_BOT_TOKEN = os.getenv("BOT_TOKEN")
 TELEGRAM_CHANNEL_ID = -1003857194781
 ADMIN_ID = 417850992
 
+# Источники в порядке: Франкфурт → Сингапур → Публичный → Nitter
+RSSHUB_SERVERS = [
+    "https://chelsea-rss-bridge.onrender.com",       # 1. Франкфурт
+    "https://chelsea-rss-bridge-sg.onrender.com",    # 2. Сингапур
+    "https://rsshub.rssforever.com",                 # 3. Публичный
+]
+NITTER_MIRRORS = [
+    "https://nitter.net",                            # 4. Nitter (последний)
+    "https://xcancel.com",
+]
+
 SENT_POSTS_FILE = "sent_posts.txt"
 FANS_FILE = "chelsea_fans.txt"
 BLOGGERS_FILE = "general_bloggers.txt"
 KEYWORDS_FILE = "keywords.txt"
 
-MAX_PARALLEL = 3  # Меньше одновременных запросов
+MAX_PARALLEL = 5
 semaphore = asyncio.Semaphore(MAX_PARALLEL)
 
 sent_posts_cache = set()
@@ -36,29 +48,10 @@ adding_lock = asyncio.Lock()
 
 BOOT_TIME = None
 
-# 12 Nitter-зеркал
-NITTER_MIRRORS = [
-    "https://nitter.net",
-    "https://xcancel.com",
-    "https://nitter.poast.org",
-    "https://nitter.privacydev.net",
-    "https://nitter.1d4.us",
-    "https://nitter.kavin.rocks",
-    "https://nitter.unixfox.eu",
-    "https://nitter.domain.glass",
-    "https://nitter.cz",
-    "https://nitter.fdn.fr",
-    "https://nitter.mint.lgbt",
-    "https://nitter.space",
-]
-
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1",
 ]
 
 # --- ВРЕМЯ ЗАПУСКА БОТА ---
@@ -141,6 +134,54 @@ def clean_html(text):
     text = re.sub(r'\n\s*\n', '\n\n', text)
     return text.strip()
 
+def extract_images_rss(entry):
+    images = []
+    raw_desc = getattr(entry, "description", "") or getattr(entry, "summary", "")
+    img_urls = re.findall(r'<img[^>]+src="([^"]+)"', raw_desc)
+    for url in img_urls:
+        url = url.replace("&amp;", "&")
+        if url not in images and "pbs.twimg.com" in url:
+            images.append(url)
+    if not images and hasattr(entry, "media_content") and entry.media_content:
+        for media in entry.media_content:
+            url = media.get("url", "").replace("&amp;", "&")
+            if url and url not in images:
+                images.append(url)
+    return images
+
+def extract_text_rss(entry):
+    description = getattr(entry, "description", "") or getattr(entry, "summary", "")
+    if description:
+        parts = re.split(r'<hr[^>]*>|<div class="rsshub-quote">', description)
+        main_text = parts[0]
+        quote_text = ""
+        if len(parts) > 1:
+            quote_text = clean_html(parts[1])
+            if quote_text:
+                quote_text = f"\n\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n{quote_text}\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄"
+        text = clean_html(re.sub(r'<br\s*/?>', '\n', main_text))
+        text = text + quote_text
+        if text.strip():
+            external_urls = re.findall(r'https?://[^\s"\'<&]+', description)
+            for url in external_urls:
+                if any(d in url for d in ['x.com', 'twitter.com', 'pbs.twimg.com', 'video.twimg.com']):
+                    continue
+                if url not in text:
+                    text = text + "\n" + url
+            return text.strip()
+    title = getattr(entry, "title", "") or ""
+    return clean_html(title)
+
+def extract_videos_rss(entry):
+    videos = []
+    raw_desc = getattr(entry, "description", "") or getattr(entry, "summary", "")
+    video_urls = re.findall(r'<video[^>]+src="([^"]+)"', raw_desc)
+    for url in video_urls:
+        url = url.replace("&amp;", "&")
+        if url not in videos:
+            videos.append(url)
+    return videos
+
 def parse_tweet_time(datetime_str):
     if not datetime_str:
         return None
@@ -154,12 +195,39 @@ def parse_tweet_time(datetime_str):
             pass
     return None
 
-# --- ПАРСИНГ ТВИТОВ ЧЕРЕЗ NITTER (12 ЗЕРКАЛ) ---
-async def fetch_tweets_nitter(username):
-    tweets = []
-    display_name = username
+# --- ИСТОЧНИК 1-3: RSSHUB ---
+async def fetch_via_rsshub(username):
+    for rsshub_url in RSSHUB_SERVERS:
+        url = f"{rsshub_url}/twitter/user/{username}"
+        try:
+            async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+                headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/rss+xml, */*"}
+                response = await client.get(url, headers=headers)
+                if response.status_code != 200:
+                    continue
+                feed = feedparser.parse(response.text)
+                display_name = username
+                if hasattr(feed.feed, "title"):
+                    display_name = feed.feed.title.replace("Twitter @", "").strip()
 
-    # Перемешиваем зеркала
+                tweets = []
+                for entry in feed.entries:
+                    text = extract_text_rss(entry)
+                    images = extract_images_rss(entry)
+                    videos = extract_videos_rss(entry)
+                    link = entry.link if hasattr(entry, "link") else ""
+                    published = entry.published if hasattr(entry, "published") else None
+                    tweets.append({"text": text, "link": link, "images": images, "videos": videos, "display_name": display_name, "username": username, "published": published})
+
+                if tweets:
+                    logger.info(f"📡 @{username}: {len(tweets)} твитов через RSSHub ({rsshub_url})")
+                    return display_name, tweets
+        except:
+            continue
+    return username, []
+
+# --- ИСТОЧНИК 4: NITTER (ПОСЛЕДНИЙ) ---
+async def fetch_via_nitter(username):
     mirrors = NITTER_MIRRORS.copy()
     random.shuffle(mirrors)
 
@@ -167,62 +235,38 @@ async def fetch_tweets_nitter(username):
         url = f"{mirror}/{username}"
         try:
             ua = random.choice(USER_AGENTS)
-            headers = {
-                "User-Agent": ua,
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "en-US,en;q=0.9",
-            }
-
-            async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
+            headers = {"User-Agent": ua, "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", "Accept-Language": "en-US,en;q=0.9"}
+            async with httpx.AsyncClient(timeout=12.0, follow_redirects=True) as client:
                 response = await client.get(url, headers=headers)
-
-                if response.status_code == 429:
-                    logger.warning(f"⚠️ @{username}: {mirror} -> 429, пропускаем")
-                    continue
-                if response.status_code == 403:
-                    logger.warning(f"⚠️ @{username}: {mirror} -> 403, пропускаем")
-                    continue
-                if response.status_code == 503:
-                    logger.warning(f"⚠️ @{username}: {mirror} -> 503, пропускаем")
-                    continue
                 if response.status_code != 200:
                     continue
-
                 soup = BeautifulSoup(response.text, "lxml")
+                tweet_divs = soup.select("div.timeline-item")
+                if not tweet_divs:
+                    continue
 
-                # Имя профиля
+                display_name = username
                 name_tag = soup.select_one("a.profile-card-fullname")
                 if name_tag:
                     display_name = name_tag.text.strip()
 
-                # Ищем твиты
-                tweet_divs = soup.select("div.timeline-item")
-
-                if not tweet_divs:
-                    logger.info(f"⚠️ @{username}: {mirror} — нет твитов на странице")
-                    continue
-
+                tweets = []
                 for div in tweet_divs:
                     try:
                         content_div = div.select_one("div.tweet-content")
                         if not content_div:
                             continue
                         text = content_div.text.strip()
-
                         link_tag = div.select_one("a.tweet-link")
                         if not link_tag:
                             continue
                         href = link_tag.get("href", "")
                         if not href.startswith("http"):
                             href = f"{mirror}{href}"
-                        link = href
-                        # Приводим к x.com для сохранения
-                        link_x = re.sub(r'https?://[^/]+/', 'https://x.com/', link)
-
+                        link = re.sub(r'https?://[^/]+/', 'https://x.com/', href)
                         date_tag = div.select_one("span.tweet-date a")
                         published = date_tag.get("title", "") if date_tag else ""
                         tweet_time = parse_tweet_time(published)
-
                         images = []
                         for att in div.select("div.attachment, div.attachments"):
                             for img in att.select("img"):
@@ -231,15 +275,6 @@ async def fetch_tweets_nitter(username):
                                     if src.startswith("/"):
                                         src = f"{mirror}{src}"
                                     images.append(src)
-
-                        if not images:
-                            for img in div.select("div.tweet-body img"):
-                                src = img.get("src", "")
-                                if src and "pbs.twimg.com" in src and "emoji" not in src.lower() and src not in images:
-                                    if src.startswith("/"):
-                                        src = f"{mirror}{src}"
-                                    images.append(src)
-
                         videos = []
                         video_tag = div.select_one("video")
                         if video_tag:
@@ -248,59 +283,47 @@ async def fetch_tweets_nitter(username):
                                 if src.startswith("/"):
                                     src = f"{mirror}{src}"
                                 videos.append(src)
-                            else:
-                                source_tag = video_tag.select_one("source")
-                                if source_tag:
-                                    src = source_tag.get("src", "")
-                                    if src and src.startswith("/"):
-                                        src = f"{mirror}{src}"
-                                    if src:
-                                        videos.append(src)
-
-                        tweets.append({
-                            "text": text,
-                            "link": link_x,
-                            "images": images,
-                            "videos": videos,
-                            "display_name": display_name,
-                            "username": username,
-                            "published": published if published else None,
-                            "tweet_time": tweet_time
-                        })
-                    except Exception as e:
-                        logger.error(f"⚠️ @{username}: ошибка парсинга: {e}")
+                        tweets.append({"text": text, "link": link, "images": images, "videos": videos, "display_name": display_name, "username": username, "published": published if published else None, "tweet_time": tweet_time})
+                    except:
                         continue
 
                 if tweets:
-                    logger.info(f"✅ @{username}: {len(tweets)} твитов через {mirror}")
+                    logger.info(f"⚡ @{username}: {len(tweets)} твитов через Nitter ({mirror})")
                     return display_name, tweets
-
-        except Exception as e:
-            logger.warning(f"⚠️ @{username}: {mirror} ошибка: {e}")
+        except:
             continue
+    return username, []
 
-    logger.error(f"❌ @{username}: ни одно зеркало не ответило")
+# --- ГЛАВНАЯ ФУНКЦИЯ: RSSHUB (3 сервера) → NITTER ---
+async def fetch_tweets(username):
+    # Сначала пробуем RSSHub (Франкфурт → Сингапур → Публичный)
+    display_name, tweets = await fetch_via_rsshub(username)
+    if tweets:
+        return display_name, tweets
+
+    # Если RSSHub не дал — пробуем Nitter
+    display_name, tweets = await fetch_via_nitter(username)
+    if tweets:
+        return display_name, tweets
+
+    logger.error(f"❌ @{username}: все 4 источника не ответили")
     return username, []
 
 async def fetch_tweets_with_limit(username):
     async with semaphore:
-        # Увеличенная пауза между запросами
-        await asyncio.sleep(random.uniform(1.0, 3.0))
-        return await fetch_tweets_nitter(username)
+        await asyncio.sleep(random.uniform(0.3, 1.0))
+        return await fetch_tweets(username)
 
 async def fetch_all_tweets(usernames):
     tasks = [fetch_tweets_with_limit(username) for username in usernames]
     results = await asyncio.gather(*tasks, return_exceptions=True)
-
     all_tweets = []
     for result in results:
         if isinstance(result, Exception):
-            logger.error(f"❌ Ошибка при проверке: {result}")
             continue
         display_name, tweets = result
         if tweets:
             all_tweets.extend(tweets)
-
     return all_tweets
 
 def extract_tweet_id(tweet):
@@ -326,31 +349,21 @@ def is_tweet_too_old(tweet, username=None):
     boot_time = get_boot_time()
     if not boot_time:
         return False
-
-    tweet_time = tweet.get("tweet_time")
-    if not tweet_time:
-        published_str = tweet.get("published")
-        if not published_str:
-            return False
-        tweet_time = parse_tweet_time(published_str)
-        if not tweet_time:
-            return False
-
-    return tweet_time < boot_time
+    published_str = tweet.get("published")
+    if not published_str:
+        return False
+    try:
+        tweet_time = parsedate_to_datetime(published_str)
+        return tweet_time < boot_time
+    except:
+        return False
 
 def is_admin(user_id): return user_id == ADMIN_ID
 
 # --- АДМИН-КОМАНДЫ ---
 async def cmd_start(update, context):
     if not is_admin(update.effective_user.id): return
-    await update.message.reply_text(
-        "👋 Привет, админ!\n\n"
-        "📋 Фан-каналы:\n/addfan, /addmanyfan, /removefan, /listfan\n\n"
-        "📋 Блогеры:\n/addblogger, /addmanyblogger, /removeblogger, /removemanyblogger, /listbloggers\n\n"
-        "🔑 Ключевые слова:\n/addword, /addwords, /removeword, /removemanywords, /listwords\n\n"
-        "📊 /status, /force\n\n"
-        "⚡ Nitter (12 зеркал)"
-    )
+    await update.message.reply_text("👋 Привет, админ!\n\n📋 Фан-каналы:\n/addfan, /addmanyfan, /removefan, /listfan\n\n📋 Блогеры:\n/addblogger, /addmanyblogger, /removeblogger, /removemanyblogger, /listbloggers\n\n🔑 Ключевые слова:\n/addword, /addwords, /removeword, /removemanywords, /listwords\n\n📊 /status, /force\n\n⚡ 4 источника: Франкфурт → Сингапур → Публичный → Nitter")
 
 async def cmd_addfan(update, context):
     if not is_admin(update.effective_user.id): return
@@ -480,7 +493,6 @@ async def cmd_removemanyblogger(update, context):
     links = re.findall(r'https?://(?:x\.com|twitter\.com)/(\w+)', raw_input)
     usernames = list(dict.fromkeys(mentions + links))
     if not usernames: await update.message.reply_text("❌ Не удалось распознать username."); return
-
     bloggers = load_bloggers()
     removed, not_found = [], []
     for username in usernames:
@@ -489,7 +501,6 @@ async def cmd_removemanyblogger(update, context):
             removed.append(f"• @{username}")
         else:
             not_found.append(f"• @{username}")
-
     save_bloggers(bloggers)
     report = []
     if removed: report.append(f"✅ Удалены ({len(removed)}):\n" + "\n".join(removed))
@@ -558,7 +569,6 @@ async def cmd_removemanywords(update, context):
     words = re.split(r'[,\n]+', raw_input)
     words = [w.strip() for w in words if w.strip()]
     if not words: await update.message.reply_text("❌ Не удалось распознать слова."); return
-
     keywords = load_keywords()
     removed, not_found = [], []
     for word in words:
@@ -572,7 +582,6 @@ async def cmd_removemanywords(update, context):
             removed.append(found)
         else:
             not_found.append(word)
-
     save_keywords(keywords)
     report = []
     if removed: report.append(f"✅ Удалены ({len(removed)}): {', '.join(removed)}")
@@ -591,9 +600,7 @@ async def cmd_status(update, context):
     bloggers = load_bloggers()
     keywords = load_keywords()
     sent = len(sent_posts_cache)
-    await update.message.reply_text(
-        f"✅ Бот активен\n📡 @chelsea_news_insider\n🔵 Фан-каналов: {len(fans)}\n🟡 Блогеров: {len(bloggers)}\n🔑 Слов: {len(keywords)}\n📤 Постов: {sent}\n⚡ Nitter (12 зеркал)"
-    )
+    await update.message.reply_text(f"✅ Бот активен\n📡 @chelsea_news_insider\n🔵 Фан-каналов: {len(fans)}\n🟡 Блогеров: {len(bloggers)}\n🔑 Слов: {len(keywords)}\n📤 Постов: {sent}\n⚡ 4 источника: ФР → СГ → Пуб → Nitter")
 
 async def cmd_force(update, context):
     if not is_admin(update.effective_user.id): return
@@ -608,14 +615,12 @@ async def send_post(bot: Bot, tweet, username):
     videos = tweet["videos"]
     display_name = tweet["display_name"]
     post_link = tweet["link"]
-
     safe_text = escape_html(text)
     signature = f"\n\n<b>{display_name}</b> | https://x.com/{username}\n\n🔗 Post link: {post_link}"
 
     try:
         if videos:
-            video_link = videos[0]
-            full_text = f"{safe_text}\n\n🎬 Video: {video_link}{signature}"
+            full_text = f"{safe_text}\n\n🎬 Video: {videos[0]}{signature}"
             await bot.send_message(TELEGRAM_CHANNEL_ID, full_text[:4096], parse_mode='HTML', disable_web_page_preview=True)
         elif images:
             full_text = safe_text + signature
@@ -630,13 +635,11 @@ async def send_post(bot: Bot, tweet, username):
                         media.append(InputMediaPhoto(media=img))
                 await bot.send_media_group(TELEGRAM_CHANNEL_ID, media)
         else:
-            full_text = safe_text + signature
-            await bot.send_message(TELEGRAM_CHANNEL_ID, full_text, parse_mode='HTML', disable_web_page_preview=True)
+            await bot.send_message(TELEGRAM_CHANNEL_ID, safe_text + signature, parse_mode='HTML', disable_web_page_preview=True)
     except TelegramError as e:
         logger.error(f"Ошибка отправки: {e}")
         try:
-            fallback = text + f"\n\n{display_name} | https://x.com/{username}\n\n🔗 Post link: {post_link}"
-            await bot.send_message(TELEGRAM_CHANNEL_ID, fallback[:4096], disable_web_page_preview=True)
+            await bot.send_message(TELEGRAM_CHANNEL_ID, text + f"\n\n{display_name} | https://x.com/{username}\n\n🔗 Post link: {post_link}"[:4096], disable_web_page_preview=True)
         except:
             pass
 
@@ -644,25 +647,21 @@ async def check_and_post(bot: Bot):
     global sent_posts_cache
     async with adding_lock:
         pass
-
     fans = load_fans()
     bloggers = load_bloggers()
     all_usernames = list(set(fans + bloggers))
-
     if not all_usernames:
         return 0
-
     if not sent_posts_cache:
         sent_posts_cache = load_sent_posts()
 
-    logger.info(f"🔄 Проверка {len(all_usernames)} каналов (макс {MAX_PARALLEL} одновременно, 12 зеркал)...")
+    logger.info(f"🔄 Проверка {len(all_usernames)} каналов (4 источника)...")
     start_time = time.time()
     all_tweets = await fetch_all_tweets(all_usernames)
     elapsed = time.time() - start_time
     logger.info(f"⏱ Проверка заняла {elapsed:.1f} сек, получено {len(all_tweets)} твитов")
 
     all_tweets.sort(key=extract_tweet_id)
-
     keywords = load_keywords()
     new_posts = 0
 
@@ -670,16 +669,12 @@ async def check_and_post(bot: Bot):
         link = tweet["link"]
         if link in sent_posts_cache:
             continue
-
         username = tweet["username"]
-
         if is_tweet_too_old(tweet):
             continue
-
         if username in bloggers and username not in fans:
             if not post_matches_filter(tweet["text"], keywords):
                 continue
-
         await send_post(bot, tweet, username)
         save_sent_post(link)
         new_posts += 1
@@ -696,14 +691,13 @@ async def scheduled_check(bot: Bot):
             await check_and_post(bot)
         except Exception as e:
             logger.error(f"Цикл: {e}")
-        await asyncio.sleep(30)
+        await asyncio.sleep(20)
 
 async def main():
     global sent_posts_cache
     if not TELEGRAM_BOT_TOKEN:
         logger.critical("❌ Нет BOT_TOKEN!")
         return
-
     boot_time = get_boot_time()
     sent_posts_cache = load_sent_posts()
     bot = Bot(token=TELEGRAM_BOT_TOKEN)
@@ -726,8 +720,7 @@ async def main():
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("force", cmd_force))
     asyncio.create_task(scheduled_check(bot))
-    logger.info(f"🤖 Бот запущен — Nitter (12 зеркал, время старта: {boot_time.isoformat()})")
-    logger.info("📌 Твиты старше этого времени не будут отправлены")
+    logger.info(f"🤖 Бот запущен — 4 источника (старт: {boot_time.isoformat()})")
     await app.run_polling()
 
 if __name__ == "__main__":
