@@ -28,7 +28,7 @@ FANS_FILE = "chelsea_fans.txt"
 BLOGGERS_FILE = "general_bloggers.txt"
 KEYWORDS_FILE = "keywords.txt"
 
-MAX_PARALLEL = 5
+MAX_PARALLEL = 3  # Меньше одновременных запросов
 semaphore = asyncio.Semaphore(MAX_PARALLEL)
 
 sent_posts_cache = set()
@@ -36,19 +36,29 @@ adding_lock = asyncio.Lock()
 
 BOOT_TIME = None
 
-# User-Agent'ы для ротации
+# 12 Nitter-зеркал
+NITTER_MIRRORS = [
+    "https://nitter.net",
+    "https://xcancel.com",
+    "https://nitter.poast.org",
+    "https://nitter.privacydev.net",
+    "https://nitter.1d4.us",
+    "https://nitter.kavin.rocks",
+    "https://nitter.unixfox.eu",
+    "https://nitter.domain.glass",
+    "https://nitter.cz",
+    "https://nitter.fdn.fr",
+    "https://nitter.mint.lgbt",
+    "https://nitter.space",
+]
+
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0",
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-]
-
-# Зеркала Nitter для парсинга
-NITTER_MIRRORS = [
-    "https://nitter.net",
-    "https://xcancel.com",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1",
 ]
 
 # --- ВРЕМЯ ЗАПУСКА БОТА ---
@@ -132,7 +142,6 @@ def clean_html(text):
     return text.strip()
 
 def parse_tweet_time(datetime_str):
-    """Парсит время твита из разных форматов."""
     if not datetime_str:
         return None
     for fmt in ["%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S.%f%z", "%Y-%m-%dT%H:%M:%S.%f"]:
@@ -145,13 +154,16 @@ def parse_tweet_time(datetime_str):
             pass
     return None
 
-# --- ПАРСИНГ ТВИТОВ ЧЕРЕЗ NITTER ---
+# --- ПАРСИНГ ТВИТОВ ЧЕРЕЗ NITTER (12 ЗЕРКАЛ) ---
 async def fetch_tweets_nitter(username):
-    """Парсит твиты через Nitter-зеркала (статический HTML, быстро)."""
     tweets = []
     display_name = username
 
-    for mirror in NITTER_MIRRORS:
+    # Перемешиваем зеркала
+    mirrors = NITTER_MIRRORS.copy()
+    random.shuffle(mirrors)
+
+    for mirror in mirrors:
         url = f"{mirror}/{username}"
         try:
             ua = random.choice(USER_AGENTS)
@@ -161,11 +173,19 @@ async def fetch_tweets_nitter(username):
                 "Accept-Language": "en-US,en;q=0.9",
             }
 
-            async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+            async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
                 response = await client.get(url, headers=headers)
 
+                if response.status_code == 429:
+                    logger.warning(f"⚠️ @{username}: {mirror} -> 429, пропускаем")
+                    continue
+                if response.status_code == 403:
+                    logger.warning(f"⚠️ @{username}: {mirror} -> 403, пропускаем")
+                    continue
+                if response.status_code == 503:
+                    logger.warning(f"⚠️ @{username}: {mirror} -> 503, пропускаем")
+                    continue
                 if response.status_code != 200:
-                    logger.warning(f"⚠️ @{username}: {mirror} -> {response.status_code}")
                     continue
 
                 soup = BeautifulSoup(response.text, "lxml")
@@ -179,33 +199,30 @@ async def fetch_tweets_nitter(username):
                 tweet_divs = soup.select("div.timeline-item")
 
                 if not tweet_divs:
-                    logger.info(f"⚠️ @{username}: {mirror} — твиты не найдены на странице")
+                    logger.info(f"⚠️ @{username}: {mirror} — нет твитов на странице")
                     continue
 
                 for div in tweet_divs:
                     try:
-                        # Текст твита
                         content_div = div.select_one("div.tweet-content")
                         if not content_div:
                             continue
                         text = content_div.text.strip()
 
-                        # Ссылка на твит
                         link_tag = div.select_one("a.tweet-link")
                         if not link_tag:
                             continue
                         href = link_tag.get("href", "")
                         if not href.startswith("http"):
                             href = f"{mirror}{href}"
-                        # Приводим к x.com
-                        link = href.replace("nitter.net", "x.com").replace("xcancel.com", "x.com")
+                        link = href
+                        # Приводим к x.com для сохранения
+                        link_x = re.sub(r'https?://[^/]+/', 'https://x.com/', link)
 
-                        # Время
                         date_tag = div.select_one("span.tweet-date a")
                         published = date_tag.get("title", "") if date_tag else ""
                         tweet_time = parse_tweet_time(published)
 
-                        # Картинки
                         images = []
                         for att in div.select("div.attachment, div.attachments"):
                             for img in att.select("img"):
@@ -215,7 +232,6 @@ async def fetch_tweets_nitter(username):
                                         src = f"{mirror}{src}"
                                     images.append(src)
 
-                        # Если картинок нет — ищем в теле твита
                         if not images:
                             for img in div.select("div.tweet-body img"):
                                 src = img.get("src", "")
@@ -224,7 +240,6 @@ async def fetch_tweets_nitter(username):
                                         src = f"{mirror}{src}"
                                     images.append(src)
 
-                        # Видео
                         videos = []
                         video_tag = div.select_one("video")
                         if video_tag:
@@ -244,7 +259,7 @@ async def fetch_tweets_nitter(username):
 
                         tweets.append({
                             "text": text,
-                            "link": link,
+                            "link": link_x,
                             "images": images,
                             "videos": videos,
                             "display_name": display_name,
@@ -253,7 +268,7 @@ async def fetch_tweets_nitter(username):
                             "tweet_time": tweet_time
                         })
                     except Exception as e:
-                        logger.error(f"⚠️ @{username}: ошибка парсинга твита: {e}")
+                        logger.error(f"⚠️ @{username}: ошибка парсинга: {e}")
                         continue
 
                 if tweets:
@@ -264,12 +279,13 @@ async def fetch_tweets_nitter(username):
             logger.warning(f"⚠️ @{username}: {mirror} ошибка: {e}")
             continue
 
-    logger.error(f"❌ @{username}: твиты не найдены ни на одном зеркале")
+    logger.error(f"❌ @{username}: ни одно зеркало не ответило")
     return username, []
 
 async def fetch_tweets_with_limit(username):
     async with semaphore:
-        await asyncio.sleep(random.uniform(0.5, 1.5))
+        # Увеличенная пауза между запросами
+        await asyncio.sleep(random.uniform(1.0, 3.0))
         return await fetch_tweets_nitter(username)
 
 async def fetch_all_tweets(usernames):
@@ -333,7 +349,7 @@ async def cmd_start(update, context):
         "📋 Блогеры:\n/addblogger, /addmanyblogger, /removeblogger, /removemanyblogger, /listbloggers\n\n"
         "🔑 Ключевые слова:\n/addword, /addwords, /removeword, /removemanywords, /listwords\n\n"
         "📊 /status, /force\n\n"
-        "⚡ Прямой парсинг через Nitter"
+        "⚡ Nitter (12 зеркал)"
     )
 
 async def cmd_addfan(update, context):
@@ -576,7 +592,7 @@ async def cmd_status(update, context):
     keywords = load_keywords()
     sent = len(sent_posts_cache)
     await update.message.reply_text(
-        f"✅ Бот активен\n📡 @chelsea_news_insider\n🔵 Фан-каналов: {len(fans)}\n🟡 Блогеров: {len(bloggers)}\n🔑 Слов: {len(keywords)}\n📤 Постов: {sent}\n⚡ Прямой парсинг через Nitter"
+        f"✅ Бот активен\n📡 @chelsea_news_insider\n🔵 Фан-каналов: {len(fans)}\n🟡 Блогеров: {len(bloggers)}\n🔑 Слов: {len(keywords)}\n📤 Постов: {sent}\n⚡ Nitter (12 зеркал)"
     )
 
 async def cmd_force(update, context):
@@ -639,7 +655,7 @@ async def check_and_post(bot: Bot):
     if not sent_posts_cache:
         sent_posts_cache = load_sent_posts()
 
-    logger.info(f"🔄 Прямая проверка {len(all_usernames)} каналов (макс {MAX_PARALLEL} одновременно)...")
+    logger.info(f"🔄 Проверка {len(all_usernames)} каналов (макс {MAX_PARALLEL} одновременно, 12 зеркал)...")
     start_time = time.time()
     all_tweets = await fetch_all_tweets(all_usernames)
     elapsed = time.time() - start_time
@@ -680,7 +696,7 @@ async def scheduled_check(bot: Bot):
             await check_and_post(bot)
         except Exception as e:
             logger.error(f"Цикл: {e}")
-        await asyncio.sleep(20)
+        await asyncio.sleep(30)
 
 async def main():
     global sent_posts_cache
@@ -710,7 +726,7 @@ async def main():
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("force", cmd_force))
     asyncio.create_task(scheduled_check(bot))
-    logger.info(f"🤖 Бот запущен — прямой парсинг через Nitter (время старта: {boot_time.isoformat()})")
+    logger.info(f"🤖 Бот запущен — Nitter (12 зеркал, время старта: {boot_time.isoformat()})")
     logger.info("📌 Твиты старше этого времени не будут отправлены")
     await app.run_polling()
 
