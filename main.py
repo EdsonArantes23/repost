@@ -9,7 +9,7 @@ from email.utils import parsedate_to_datetime
 
 import httpx
 import nest_asyncio
-import feedparser
+from bs4 import BeautifulSoup
 from telegram import Bot, InputMediaPhoto
 from telegram.error import TelegramError
 from telegram.ext import Application, CommandHandler, ContextTypes
@@ -23,20 +23,30 @@ TELEGRAM_BOT_TOKEN = os.getenv("BOT_TOKEN")
 TELEGRAM_CHANNEL_ID = -1003857194781
 ADMIN_ID = 417850992
 
-RSSHUB_URL = "https://chelsea-rss-bridge.onrender.com"
-
 SENT_POSTS_FILE = "sent_posts.txt"
 FANS_FILE = "chelsea_fans.txt"
 BLOGGERS_FILE = "general_bloggers.txt"
 KEYWORDS_FILE = "keywords.txt"
 
-MAX_PARALLEL = 10
+MAX_PARALLEL = 5  # Меньше одновременных запросов — меньше шанс бана
 semaphore = asyncio.Semaphore(MAX_PARALLEL)
 
 sent_posts_cache = set()
 adding_lock = asyncio.Lock()
 
 BOOT_TIME = None
+
+# Кеш количества твитов
+tweet_count_cache = {}
+
+# User-Agent'ы для ротации
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+]
 
 # --- ВРЕМЯ ЗАПУСКА БОТА ---
 def get_boot_time():
@@ -109,11 +119,9 @@ def post_matches_filter(text, keywords):
     return False
 
 def escape_html(text):
-    """Экранирует HTML-спецсимволы, кроме наших тегов."""
     return text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
 
 def clean_html(text):
-    """Убирает HTML-теги и entities из текста."""
     text = re.sub(r'<[^>]+>', '', text)
     text = text.replace('&lt;', '<').replace('&gt;', '>').replace('&amp;', '&')
     text = text.replace('&#39;', "'").replace('&quot;', '"')
@@ -121,126 +129,137 @@ def clean_html(text):
     text = re.sub(r'\n\s*\n', '\n\n', text)
     return text.strip()
 
-def extract_images(entry):
-    images = []
-    raw_desc = getattr(entry, "description", "") or getattr(entry, "summary", "")
+def parse_tweet_time(datetime_str):
+    """Парсит время твита из атрибута datetime."""
+    try:
+        return datetime.strptime(datetime_str, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=timezone.utc)
+    except:
+        try:
+            return datetime.strptime(datetime_str, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        except:
+            return None
 
-    img_urls = re.findall(r'<img[^>]+src="([^"]+)"', raw_desc)
-    for url in img_urls:
-        url = url.replace("&amp;", "&")
-        if url not in images and "pbs.twimg.com" in url:
-            images.append(url)
-
-    if not images and hasattr(entry, "media_content") and entry.media_content:
-        for media in entry.media_content:
-            url = media.get("url", "").replace("&amp;", "&")
-            if url and url not in images:
-                images.append(url)
-
-    if not images:
-        direct_urls = re.findall(r'https?://pbs\.twimg\.com/media/[^\s"\'&]+', raw_desc)
-        for url in direct_urls:
-            url = url.replace("&amp;", "&")
-            if url not in images:
-                images.append(url)
-
-    if not images and hasattr(entry, "enclosures") and entry.enclosures:
-        for enc in entry.enclosures:
-            url = enc.get("href", "").replace("&amp;", "&")
-            if url and url not in images and "image" in enc.get("type", ""):
-                images.append(url)
-
-    return images
-
-def extract_text(entry):
-    description = getattr(entry, "description", "") or getattr(entry, "summary", "")
-
-    if description:
-        parts = re.split(r'<hr[^>]*>|<div class="rsshub-quote">', description)
-        main_text = parts[0]
-        quote_text = ""
-        if len(parts) > 1:
-            quote_raw = parts[1]
-            quote_text = clean_html(quote_raw)
-            if quote_text:
-                quote_text = f"\n\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n{quote_text}\n┄┄┄┄┄┄┄┄┄┄┄┄┄┄"
-
-        text_with_breaks = re.sub(r'<br\s*/?>', '\n', main_text)
-        text = clean_html(text_with_breaks)
-        text = text + quote_text
-
-        if text.strip():
-            external_urls = re.findall(r'https?://[^\s"\'<&]+', description)
-            for url in external_urls:
-                if any(d in url for d in ['x.com', 'twitter.com', 'pbs.twimg.com', 'video.twimg.com']):
-                    continue
-                if url not in text:
-                    text = text + "\n" + url
-            return text.strip()
-
-    title = getattr(entry, "title", "") or ""
-    return clean_html(title)
-
-def extract_videos(entry):
-    videos = []
-    raw_desc = getattr(entry, "description", "") or getattr(entry, "summary", "")
-
-    video_urls = re.findall(r'<video[^>]+src="([^"]+)"', raw_desc)
-    for url in video_urls:
-        url = url.replace("&amp;", "&")
-        if url not in videos:
-            videos.append(url)
-
-    source_urls = re.findall(r'<source[^>]+src="([^"]+)"', raw_desc)
-    for url in source_urls:
-        url = url.replace("&amp;", "&")
-        if url not in videos:
-            videos.append(url)
-
-    return videos
-
-async def fetch_tweets(username):
-    url = f"{RSSHUB_URL}/twitter/user/{username}"
+# --- ПРЯМОЙ ПАРСИНГ X.COM ---
+async def fetch_tweets_direct(username):
+    """Парсит твиты напрямую с X.com."""
+    url = f"https://x.com/{username}"
+    tweets = []
+    display_name = username
 
     for attempt in range(2):
         try:
-            async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
-                headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/rss+xml, */*"}
+            ua = random.choice(USER_AGENTS)
+            headers = {
+                "User-Agent": ua,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Accept-Encoding": "gzip, deflate, br",
+                "Cache-Control": "no-cache",
+                "Pragma": "no-cache",
+            }
+
+            async with httpx.AsyncClient(timeout=15.0, follow_redirects=True, http2=True) as client:
                 response = await client.get(url, headers=headers)
 
+                if response.status_code == 429:
+                    wait = 10 * (attempt + 1)
+                    logger.warning(f"⚠️ @{username}: 429 rate limit, жду {wait} сек...")
+                    await asyncio.sleep(wait)
+                    continue
+
                 if response.status_code == 503:
-                    wait = 3 if attempt == 0 else 5
+                    wait = 5 if attempt == 0 else 10
                     logger.warning(f"⚠️ @{username}: 503, попытка {attempt+1}/2, жду {wait} сек...")
                     await asyncio.sleep(wait)
                     continue
 
                 response.raise_for_status()
-                feed = feedparser.parse(response.text)
+                soup = BeautifulSoup(response.text, "lxml")
 
-                display_name = username
-                if hasattr(feed.feed, "title"):
-                    display_name = feed.feed.title.replace("Twitter @", "").strip()
+                # Имя профиля
+                name_tag = soup.select_one('div[data-testid="UserName"] span')
+                if name_tag:
+                    display_name = name_tag.text.strip()
 
-                tweets = []
-                for entry in feed.entries:
-                    text = extract_text(entry)
-                    images = extract_images(entry)
-                    videos = extract_videos(entry)
-                    link = entry.link if hasattr(entry, "link") else ""
-                    published = entry.published if hasattr(entry, "published") else None
+                # Ищем твиты
+                tweet_articles = soup.select('article[data-testid="tweet"]')
 
-                    tweets.append({
-                        "text": text, "link": link,
-                        "images": images, "videos": videos,
-                        "display_name": display_name, "username": username,
-                        "published": published
-                    })
+                if not tweet_articles:
+                    logger.info(f"⚠️ @{username}: твиты не найдены (возможно, страница не загрузилась)")
+                    return display_name, []
 
+                for article in tweet_articles:
+                    try:
+                        # Текст твита
+                        text_tag = article.select_one('div[data-testid="tweetText"]')
+                        text = text_tag.text.strip() if text_tag else ""
+
+                        # Ссылка на твит
+                        link_tag = article.select_one('a[href*="/status/"]')
+                        link = ""
+                        if link_tag:
+                            href = link_tag.get("href", "")
+                            match = re.search(r'/status/(\d+)', href)
+                            if match:
+                                link = f"https://x.com/{username}/status/{match.group(1)}"
+
+                        if not link:
+                            continue
+
+                        # Время твита
+                        time_tag = article.select_one('time')
+                        published = None
+                        tweet_time = None
+                        if time_tag:
+                            datetime_attr = time_tag.get("datetime", "")
+                            tweet_time = parse_tweet_time(datetime_attr)
+                            if tweet_time:
+                                published = tweet_time.strftime("%a, %d %b %Y %H:%M:%S GMT")
+
+                        # Картинки
+                        images = []
+                        img_tags = article.select('img[src*="pbs.twimg.com/media"]')
+                        for img in img_tags:
+                            src = img.get("src", "")
+                            if src and src not in images:
+                                # Берем оригинальное качество
+                                src = re.sub(r'&name=\w+', '&name=orig', src)
+                                if "?format=" in src:
+                                    src = src.split('?')[0] + "?format=jpg&name=orig"
+                                images.append(src)
+
+                        # Видео
+                        videos = []
+                        video_tags = article.select('video[src*="video.twimg.com"]')
+                        for vid in video_tags:
+                            src = vid.get("src", "")
+                            if src and src not in videos:
+                                videos.append(src)
+
+                        tweets.append({
+                            "text": text,
+                            "link": link,
+                            "images": images,
+                            "videos": videos,
+                            "display_name": display_name,
+                            "username": username,
+                            "published": published,
+                            "tweet_time": tweet_time
+                        })
+                    except Exception as e:
+                        logger.error(f"⚠️ @{username}: ошибка парсинга твита: {e}")
+                        continue
+
+                logger.info(f"✅ @{username}: {len(tweets)} твитов (прямой парсинг)")
                 return display_name, tweets
 
         except httpx.HTTPStatusError as e:
-            if e.response.status_code == 503:
-                wait = 3 if attempt == 0 else 5
+            if e.response.status_code == 429:
+                wait = 10 * (attempt + 1)
+                logger.warning(f"⚠️ @{username}: 429, попытка {attempt+1}/2, жду {wait} сек...")
+                await asyncio.sleep(wait)
+            elif e.response.status_code == 503:
+                wait = 5 if attempt == 0 else 10
                 logger.warning(f"⚠️ @{username}: 503, попытка {attempt+1}/2, жду {wait} сек...")
                 await asyncio.sleep(wait)
             else:
@@ -248,7 +267,7 @@ async def fetch_tweets(username):
                 break
         except (httpx.ConnectTimeout, httpx.ReadTimeout):
             logger.warning(f"⚠️ @{username}: таймаут, попытка {attempt+1}/2")
-            await asyncio.sleep(2)
+            await asyncio.sleep(3)
         except Exception as e:
             logger.error(f"❌ @{username}: {type(e).__name__}: {e}")
             break
@@ -258,7 +277,9 @@ async def fetch_tweets(username):
 
 async def fetch_tweets_with_limit(username):
     async with semaphore:
-        return await fetch_tweets(username)
+        # Случайная пауза перед запросом (имитация человека)
+        await asyncio.sleep(random.uniform(0.5, 1.5))
+        return await fetch_tweets_direct(username)
 
 async def fetch_all_tweets(usernames):
     tasks = [fetch_tweets_with_limit(username) for username in usernames]
@@ -299,15 +320,17 @@ def is_tweet_too_old(tweet, username=None):
     if not boot_time:
         return False
 
-    published_str = tweet.get("published")
-    if not published_str:
-        return False
+    tweet_time = tweet.get("tweet_time")
+    if not tweet_time:
+        published_str = tweet.get("published")
+        if not published_str:
+            return False
+        try:
+            tweet_time = parsedate_to_datetime(published_str)
+        except:
+            return False
 
-    try:
-        tweet_time = parsedate_to_datetime(published_str)
-        return tweet_time < boot_time
-    except:
-        return False
+    return tweet_time < boot_time
 
 def is_admin(user_id): return user_id == ADMIN_ID
 
@@ -319,7 +342,8 @@ async def cmd_start(update, context):
         "📋 Фан-каналы:\n/addfan, /addmanyfan, /removefan, /listfan\n\n"
         "📋 Блогеры:\n/addblogger, /addmanyblogger, /removeblogger, /removemanyblogger, /listbloggers\n\n"
         "🔑 Ключевые слова:\n/addword, /addwords, /removeword, /removemanywords, /listwords\n\n"
-        "📊 /status, /force"
+        "📊 /status, /force\n\n"
+        "⚡ Прямой парсинг X.com (без Render)"
     )
 
 async def cmd_addfan(update, context):
@@ -562,7 +586,7 @@ async def cmd_status(update, context):
     keywords = load_keywords()
     sent = len(sent_posts_cache)
     await update.message.reply_text(
-        f"✅ Бот активен\n📡 @chelsea_news_insider\n🔵 Фан-каналов: {len(fans)}\n🟡 Блогеров: {len(bloggers)}\n🔑 Слов: {len(keywords)}\n📤 Постов: {sent}"
+        f"✅ Бот активен\n📡 @chelsea_news_insider\n🔵 Фан-каналов: {len(fans)}\n🟡 Блогеров: {len(bloggers)}\n🔑 Слов: {len(keywords)}\n📤 Постов: {sent}\n⚡ Прямой парсинг X.com"
     )
 
 async def cmd_force(update, context):
@@ -579,9 +603,7 @@ async def send_post(bot: Bot, tweet, username):
     display_name = tweet["display_name"]
     post_link = tweet["link"]
 
-    # Экранируем HTML в тексте, чтобы не сломать форматирование
     safe_text = escape_html(text)
-    # Подпись с жирным автором
     signature = f"\n\n<b>{display_name}</b> | https://x.com/{username}\n\n🔗 Post link: {post_link}"
 
     try:
@@ -607,7 +629,6 @@ async def send_post(bot: Bot, tweet, username):
     except TelegramError as e:
         logger.error(f"Ошибка отправки: {e}")
         try:
-            # Fallback без HTML-форматирования
             fallback = text + f"\n\n{display_name} | https://x.com/{username}\n\n🔗 Post link: {post_link}"
             await bot.send_message(TELEGRAM_CHANNEL_ID, fallback[:4096], disable_web_page_preview=True)
         except:
@@ -628,7 +649,7 @@ async def check_and_post(bot: Bot):
     if not sent_posts_cache:
         sent_posts_cache = load_sent_posts()
 
-    logger.info(f"🔄 Параллельная проверка {len(all_usernames)} каналов (макс {MAX_PARALLEL} одновременно)...")
+    logger.info(f"🔄 Прямая проверка {len(all_usernames)} каналов (макс {MAX_PARALLEL} одновременно)...")
     start_time = time.time()
     all_tweets = await fetch_all_tweets(all_usernames)
     elapsed = time.time() - start_time
@@ -669,7 +690,7 @@ async def scheduled_check(bot: Bot):
             await check_and_post(bot)
         except Exception as e:
             logger.error(f"Цикл: {e}")
-        await asyncio.sleep(30)
+        await asyncio.sleep(20)  # 20 секунд — быстрее, чем с RSSHub
 
 async def main():
     global sent_posts_cache
@@ -699,7 +720,7 @@ async def main():
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("force", cmd_force))
     asyncio.create_task(scheduled_check(bot))
-    logger.info(f"🤖 Бот запущен (время старта: {boot_time.isoformat()})")
+    logger.info(f"🤖 Бот запущен — прямой парсинг X.com (время старта: {boot_time.isoformat()})")
     logger.info("📌 Твиты старше этого времени не будут отправлены")
     await app.run_polling()
 
