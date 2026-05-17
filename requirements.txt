@@ -1,5 +1,5 @@
 python-telegram-bot[job-queue]==20.8
-httpx[http2]
+httpx
 nest_asyncio
 beautifulsoup4
 lxml
