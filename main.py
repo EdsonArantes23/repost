@@ -24,14 +24,14 @@ TELEGRAM_BOT_TOKEN = os.getenv("BOT_TOKEN")
 TELEGRAM_CHANNEL_ID = -1003857194781
 ADMIN_ID = 417850992
 
-# Источники в порядке: Франкфурт → Сингапур → Публичный → Nitter
+# 4 источника: Франкфурт → Сингапур → Публичный → Nitter
 RSSHUB_SERVERS = [
-    "https://chelsea-rss-bridge.onrender.com",       # 1. Франкфурт
-    "https://chelsea-rss-bridge-sg.onrender.com",    # 2. Сингапур
-    "https://rsshub.rssforever.com",                 # 3. Публичный
+    "https://chelsea-rss-bridge.onrender.com",
+    "https://chelsea-rss-bridge-sg.onrender.com",
+    "https://rsshub.rssforever.com",
 ]
 NITTER_MIRRORS = [
-    "https://nitter.net",                            # 4. Nitter (последний)
+    "https://nitter.net",
     "https://xcancel.com",
 ]
 
@@ -217,7 +217,12 @@ async def fetch_via_rsshub(username):
                     videos = extract_videos_rss(entry)
                     link = entry.link if hasattr(entry, "link") else ""
                     published = entry.published if hasattr(entry, "published") else None
-                    tweets.append({"text": text, "link": link, "images": images, "videos": videos, "display_name": display_name, "username": username, "published": published})
+                    tweets.append({
+                        "text": text, "link": link,
+                        "images": images, "videos": videos,
+                        "display_name": display_name, "username": username,
+                        "published": published
+                    })
 
                 if tweets:
                     logger.info(f"📡 @{username}: {len(tweets)} твитов через RSSHub ({rsshub_url})")
@@ -235,7 +240,11 @@ async def fetch_via_nitter(username):
         url = f"{mirror}/{username}"
         try:
             ua = random.choice(USER_AGENTS)
-            headers = {"User-Agent": ua, "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", "Accept-Language": "en-US,en;q=0.9"}
+            headers = {
+                "User-Agent": ua,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9"
+            }
             async with httpx.AsyncClient(timeout=12.0, follow_redirects=True) as client:
                 response = await client.get(url, headers=headers)
                 if response.status_code != 200:
@@ -283,7 +292,13 @@ async def fetch_via_nitter(username):
                                 if src.startswith("/"):
                                     src = f"{mirror}{src}"
                                 videos.append(src)
-                        tweets.append({"text": text, "link": link, "images": images, "videos": videos, "display_name": display_name, "username": username, "published": published if published else None, "tweet_time": tweet_time})
+                        tweets.append({
+                            "text": text, "link": link,
+                            "images": images, "videos": videos,
+                            "display_name": display_name, "username": username,
+                            "published": published if published else None,
+                            "tweet_time": tweet_time
+                        })
                     except:
                         continue
 
@@ -296,12 +311,10 @@ async def fetch_via_nitter(username):
 
 # --- ГЛАВНАЯ ФУНКЦИЯ: RSSHUB (3 сервера) → NITTER ---
 async def fetch_tweets(username):
-    # Сначала пробуем RSSHub (Франкфурт → Сингапур → Публичный)
     display_name, tweets = await fetch_via_rsshub(username)
     if tweets:
         return display_name, tweets
 
-    # Если RSSHub не дал — пробуем Nitter
     display_name, tweets = await fetch_via_nitter(username)
     if tweets:
         return display_name, tweets
@@ -346,24 +359,35 @@ async def mark_all_current_as_sent(username):
     return 0
 
 def is_tweet_too_old(tweet, username=None):
+    """Проверяет, не был ли твит опубликован ДО запуска бота.
+    Если даты нет или она не парсится — считаем твит старым (не отправляем)."""
     boot_time = get_boot_time()
     if not boot_time:
         return False
+
     published_str = tweet.get("published")
     if not published_str:
-        return False
+        return True  # Нет даты → не отправляем
+
     try:
         tweet_time = parsedate_to_datetime(published_str)
         return tweet_time < boot_time
     except:
-        return False
+        return True  # Не смогли распарсить → не отправляем
 
 def is_admin(user_id): return user_id == ADMIN_ID
 
 # --- АДМИН-КОМАНДЫ ---
 async def cmd_start(update, context):
     if not is_admin(update.effective_user.id): return
-    await update.message.reply_text("👋 Привет, админ!\n\n📋 Фан-каналы:\n/addfan, /addmanyfan, /removefan, /listfan\n\n📋 Блогеры:\n/addblogger, /addmanyblogger, /removeblogger, /removemanyblogger, /listbloggers\n\n🔑 Ключевые слова:\n/addword, /addwords, /removeword, /removemanywords, /listwords\n\n📊 /status, /force\n\n⚡ 4 источника: Франкфурт → Сингапур → Публичный → Nitter")
+    await update.message.reply_text(
+        "👋 Привет, админ!\n\n"
+        "📋 Фан-каналы:\n/addfan, /addmanyfan, /removefan, /listfan\n\n"
+        "📋 Блогеры:\n/addblogger, /addmanyblogger, /removeblogger, /removemanyblogger, /listbloggers\n\n"
+        "🔑 Ключевые слова:\n/addword, /addwords, /removeword, /removemanywords, /listwords\n\n"
+        "📊 /status, /force\n\n"
+        "⚡ 4 источника: ФР → СГ → Пуб → Nitter"
+    )
 
 async def cmd_addfan(update, context):
     if not is_admin(update.effective_user.id): return
@@ -600,7 +624,15 @@ async def cmd_status(update, context):
     bloggers = load_bloggers()
     keywords = load_keywords()
     sent = len(sent_posts_cache)
-    await update.message.reply_text(f"✅ Бот активен\n📡 @chelsea_news_insider\n🔵 Фан-каналов: {len(fans)}\n🟡 Блогеров: {len(bloggers)}\n🔑 Слов: {len(keywords)}\n📤 Постов: {sent}\n⚡ 4 источника: ФР → СГ → Пуб → Nitter")
+    await update.message.reply_text(
+        f"✅ Бот активен\n"
+        f"📡 @chelsea_news_insider\n"
+        f"🔵 Фан-каналов: {len(fans)}\n"
+        f"🟡 Блогеров: {len(bloggers)}\n"
+        f"🔑 Слов: {len(keywords)}\n"
+        f"📤 Постов: {sent}\n"
+        f"⚡ 4 источника: ФР → СГ → Пуб → Nitter"
+    )
 
 async def cmd_force(update, context):
     if not is_admin(update.effective_user.id): return
@@ -721,6 +753,7 @@ async def main():
     app.add_handler(CommandHandler("force", cmd_force))
     asyncio.create_task(scheduled_check(bot))
     logger.info(f"🤖 Бот запущен — 4 источника (старт: {boot_time.isoformat()})")
+    logger.info("📌 Твиты старше этого времени или без даты не будут отправлены")
     await app.run_polling()
 
 if __name__ == "__main__":
